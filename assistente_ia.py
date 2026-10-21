@@ -1,0 +1,1839 @@
+
+ # assistente_ia.py
+
+# Assistente de vendas (Gemini) para o painel_vendas.py, em DUAS requisições:
+
+#
+
+#   1) PLANEJAMENTO: a IA recebe a pergunta (anonimizada) e o esquema dos dados (colunas, períodos,
+
+#      métricas) e devolve um plano em JSON dizendo QUAIS dados precisa consultar. Não recebe linhas.
+
+#   2) EXECUÇÃO LOCAL: este código valida o plano (lista de dimensões/métricas permitidas), executa as
+
+#      consultas no DataFrame filtrado do painel e gera tabelas agregadas.
+
+#   3) RESPOSTA: a IA recebe a pergunta + as tabelas calculadas e escreve a resposta.
+
+#
+
+# Privacidade: nomes de clientes, vendedores, representantes e gerentes nunca são enviados; viram
+
+# "Cliente 1", "Vendedor 2"... (consistentes durante a conversa) e são trocados de volta localmente.
+
+#
+
+# Chave da API (uma das opções):
+
+#   - .streamlit/secrets.toml:  GEMINI_API_KEY = "sua-chave"
+
+#   - variável de ambiente:     GEMINI_API_KEY
+
+# Modelo (opcional): variável de ambiente GEMINI_MODEL.
+
+import json
+
+import os
+
+import re
+
+import time
+
+import unicodedata
+
+from datetime import datetime
+
+from functools import lru_cache
+
+import pandas as pd
+
+import streamlit as st
+
+from google import genai
+
+from google.genai import types
+
+MODELO_GEMINI = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+
+MAX_CONSULTAS = 4            # consultas por pergunta
+
+LIMITE_PADRAO = 20           # linhas por consulta quando o plano não diz
+
+LIMITE_MAXIMO = 200          # máximo de linhas por consulta
+
+MAX_LINHAS_TOTAIS = 300      # máximo de linhas somando todas as consultas
+
+MAX_VALORES_LISTADOS = 40    # valores listados no esquema para dimensões pequenas
+MIN_REGISTROS_GRUPO = 5     # grupos abaixo desse tamanho não são enviados ao Gemini
+
+TURNOS_HISTORICO = 4         # turnos anteriores enviados ao planejador
+
+# ============================================================
+
+# INSTRUÇÕES DA IA
+
+# ============================================================
+
+INSTRUCOES_PLANEJADOR = """
+
+Você é o PLANEJADOR de consultas de um assistente de análise de vendas.
+
+Você NÃO responde à pergunta. Sua tarefa é decidir quais dados agregados precisam ser
+
+consultados no sistema local para que outra etapa consiga responder.
+
+Responda SOMENTE com um objeto JSON válido, sem texto fora dele.
+
+FORMATO:
+
+{
+
+  "consultas": [
+
+    {
+
+      "descricao": "o que esta consulta responde",
+
+      "agrupar_por": ["produto", "mes"],
+
+      "metricas": ["faturamento", "quantidade", "preco_medio"],
+
+      "filtros": [{"dimensao": "produto", "operador": "contem", "valores": ["GP2000"]}],
+
+      "periodo": {"inicio": "2026-01-01", "fim": "2026-12-31"},
+
+      "somente_ultima_data": false,
+
+      "ordenar_por": "faturamento",
+
+      "direcao": "desc",
+
+      "limite": 20
+
+    }
+
+  ],
+
+  "esclarecimento": null
+
+}
+
+REGRAS:
+
+1. Use somente as dimensões, métricas e operadores listados no esquema recebido. Todas as colunas adicionais estão disponíveis com IDs como campo_5; a descrição ao lado informa o nome original da coluna. Use o ID, não o nome do cabeçalho, nos planos. As colunas adicionais aparecem como campo_1, campo_2 etc.; use esses IDs literalmente para agrupar e filtrar.
+
+   Operadores de filtro: "igual", "contem", "diferente".
+
+2. Clientes, vendedores, representantes e gerentes aparecem como identificadores
+
+   genéricos ("Cliente 3", "Vendedor 1"). Use-os exatamente assim nos filtros, com "igual".
+
+   Nunca tente descobrir nomes reais.
+
+3. Para produtos, use o texto que aparece na pergunta com o operador "contem",
+
+   a menos que o esquema liste o valor exato.
+
+4. Use "periodo" (datas ISO AAAA-MM-DD) para intervalos. Datas relativas ("mês passado",
+
+   "este ano") devem ser calculadas a partir de "hoje" no esquema. Se a pergunta não cita
+
+   período, não envie "periodo": os dados já respeitam os filtros ativos do painel.
+
+5. Para "última compra" ou "última data", use "somente_ultima_data": true com a métrica
+
+   "faturamento". Use "data_ultima" somente se essa métrica estiver disponível no esquema.
+   Se o esquema informar que Data Pedido é sensível, nunca solicite dia exato nem data_ultima;
+   responda em granularidade mensal, trimestral ou anual. Para a última compra de cada item,
+   agrupe por esse item.
+
+6. "preco_medio" é faturamento ÷ quantidade (média ponderada). Para preço médio por
+
+   mês, agrupe por "mes".
+
+7. Para listas ("quais produtos...", "quem comprou..."), agrupe pela dimensão pedida e use
+
+   um "limite" suficiente (até 200). Não limite a 10 quando a pergunta pede a lista completa.
+
+8. Use no máximo 4 consultas. Prefira poucas consultas bem escolhidas. Inclua uma consulta de
+
+   total geral (sem agrupar_por) quando a pergunta envolver participação ou comparação.
+
+9. Use o histórico recente para resolver referências como "essa compra", "ele", "e em 2025?",
+
+   reaproveitando os filtros da consulta anterior.
+
+10. Se a pergunta for ambígua ou não puder ser respondida com as dimensões disponíveis,
+
+    devolva "consultas": [] e escreva em "esclarecimento" uma pergunta curta ao usuário,
+
+    ou explique o que falta nos dados.
+
+11. Alguns grupos com menos de 5 registros serão ocultados por privacidade. Não tente contornar
+
+    essa regra com consultas adicionais ou combinações alternativas de dimensões.
+
+"""
+
+INSTRUCOES_IA = """
+
+Você é um assistente especializado em análise comercial e vendas.
+
+Responda sempre em português do Brasil.
+
+Você recebe a pergunta do usuário e RESULTADOS de consultas já calculadas localmente
+
+sobre os dados de vendas (já respeitando os filtros ativos do painel).
+
+REGRAS OBRIGATÓRIAS:
+
+1. Utilize exclusivamente os resultados fornecidos. Não invente valores, quantidades,
+
+   datas, produtos ou resultados.
+
+2. Se os resultados forem insuficientes ou uma consulta tiver "avisos", informe a limitação
+
+   e diga qual dado faltou. Se uma consulta voltou com 0 linhas, informe que não há vendas
+
+   para aqueles critérios nos filtros ativos; não use outros números para preencher.
+
+3. Valores monetários em reais (R$), com duas casas decimais, no padrão brasileiro.
+
+4. Não tente identificar pessoas, empresas, produtos, pedidos ou documentos. Preserve os
+
+   identificadores genéricos como "Cliente 1", "Vendedor 2", "Representante 1", "Gerente 1"
+
+   e "Dado 1" exatamente como aparecem; os valores reais serão restaurados localmente.
+
+5. Não afirme que uma linha representa um pedido único. Diferencie registros, produtos
+
+   e pedidos quando isso for relevante.
+
+6. Cada consulta traz "totais_do_filtro". Se "truncado" for verdadeiro, avise que só as
+
+   primeiras linhas foram trazidas e que há mais ("linhas_totais").
+
+7. Preço médio = faturamento ÷ quantidade (média ponderada). Não recalcule métricas
+
+   que já vieram prontas; apenas cite-as e explique o cálculo quando ajudar.
+
+8. Não invente motivos para aumentos ou quedas. Não confunda faturamento com lucro ou margem.
+
+9. Para listas, apresente uma tabela em Markdown. Cite o período considerado quando houver.
+
+10. Se faltar informação para responder, faça uma pergunta objetiva de esclarecimento.
+
+"""
+
+# ============================================================
+
+# NORMALIZAÇÃO E CONVERSÃO
+
+# ============================================================
+
+def normalizar(texto):
+
+    """Remove acentos, diferenças de caixa e espaços repetidos."""
+
+    texto = unicodedata.normalize("NFKD", str(texto))
+
+    texto = "".join(c for c in texto if not unicodedata.combining(c))
+
+    return re.sub(r"\s+", " ", texto.casefold().strip())
+
+@lru_cache(maxsize=100_000)
+
+def _normalizar_posicional(texto):
+
+    """Como normalizar(), mas com exatamente 1 caractere de saída por caractere de entrada.
+
+    Permite achar nomes ignorando acentos/caixa e trocar o trecho no texto original.
+
+    """
+
+    saida = []
+
+    for c in str(texto):
+
+        base = "".join(x for x in unicodedata.normalize("NFKD", c) if not unicodedata.combining(x))
+
+        base = base.casefold()
+
+        saida.append(base if len(base) == 1 else c)
+
+    return "".join(saida)
+
+def localizar_coluna(df, colunas_possiveis):
+
+    """Localiza uma coluna ignorando acentos e maiúsculas (aceita um nome ou uma lista)."""
+
+    if isinstance(colunas_possiveis, str):
+
+        colunas_possiveis = [colunas_possiveis]
+
+    mapa = {normalizar(coluna): coluna for coluna in df.columns}
+
+    for coluna in colunas_possiveis:
+
+        chave = normalizar(coluna)
+
+        if chave in mapa:
+
+            return mapa[chave]
+
+    raise ValueError("Nenhuma das colunas foi encontrada: " + ", ".join(colunas_possiveis))
+
+def localizar_coluna_opcional(df, colunas_possiveis):
+
+    try:
+
+        return localizar_coluna(df, colunas_possiveis)
+
+    except ValueError:
+
+        return None
+
+def converter_valor(valor):
+
+    """Converte valores monetários (formato brasileiro ou internacional) para float."""
+
+    if pd.isna(valor):
+
+        return None
+
+    if isinstance(valor, (int, float)):
+
+        return float(valor)
+
+    texto = str(valor).strip()
+
+    if not texto:
+
+        return None
+
+    texto = texto.replace("R$", "").replace("\u00a0", "").replace(" ", "")
+
+    if "," in texto and "." in texto:
+
+        if texto.rfind(",") > texto.rfind("."):
+
+            texto = texto.replace(".", "").replace(",", ".")
+
+        else:
+
+            texto = texto.replace(",", "")
+
+    elif "," in texto:
+
+        texto = texto.replace(",", ".")
+
+    try:
+
+        return float(texto)
+
+    except (ValueError, TypeError):
+
+        return None
+
+def _valores(serie):
+
+    """Série numérica (float; NaN quando inválido). Colunas já numéricas não passam por conversão linha a linha."""
+
+    if pd.api.types.is_numeric_dtype(serie):
+
+        return pd.to_numeric(serie, errors="coerce").astype(float)
+
+    return serie.map(converter_valor).astype(float)
+
+def sanitizar_valor_textual(valor):
+    """Remove padrões comuns de dados pessoais antes de qualquer texto chegar ao Gemini."""
+    texto = str(valor)
+    texto = re.sub(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b", "[EMAIL_REMOVIDO]", texto)
+    texto = re.sub(r"(?<!\d)\d{3}\.?\d{3}\.?\d{3}-?\d{2}(?!\d)", "[DOCUMENTO_REMOVIDO]", texto)
+    texto = re.sub(r"(?<!\d)\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}(?!\d)", "[DOCUMENTO_REMOVIDO]", texto)
+    texto = re.sub(r"(?<!\d)(?:\+?55\s*)?(?:\(\d{2}\)\s*|\d{2}\s+)9?\d{4}[-.\s]?\d{4}(?!\d)", "[TELEFONE_REMOVIDO]", texto)
+    return texto
+
+def formatar_moeda(valor):
+
+    return f"R$ {float(valor):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+# ============================================================
+
+# DIMENSÕES E MÉTRICAS
+
+# ============================================================
+
+# prefixo != None: dado pessoal/comercial sensível, sempre enviado como "Prefixo N".
+
+DIMENSOES_TEXTO = {
+
+    "cliente": {"rotulo": "cliente gerencial", "aliases": ["Cliente Gerencial", "Cliente"], "prefixo": "Cliente"},
+
+    "produto": {"rotulo": "produto/descrição comercial", "aliases": ["Produto", "Descrição Produto", "Descricao Produto"], "prefixo": "Dado"},
+
+    "sku": {"rotulo": "código SKU do produto", "aliases": ["SKU", "Código Produto", "Codigo Produto", "Código SKU", "Codigo SKU"], "prefixo": "Dado"},
+
+    "vendedor": {"rotulo": "vendedor", "aliases": ["Vendedor", "Representante", "Vendedor atual do cadastro"], "prefixo": "Vendedor"},
+
+    "representante": {"rotulo": "representante", "aliases": ["Representante"], "prefixo": "Representante"},
+
+    "vendedor_cadastro": {"rotulo": "vendedor atual do cadastro", "aliases": ["Vendedor atual do cadastro"], "prefixo": "Vendedor"},
+
+    "gerente_regiao": {"rotulo": "gerente de região (cadastro)", "aliases": ["Gerente região Cadastro", "Gerente região"], "prefixo": "Gerente"},
+
+    "segmento": {"rotulo": "segmento", "aliases": ["Segmento"], "prefixo": None},
+
+    "empresa": {"rotulo": "empresa", "aliases": ["Empresa"], "prefixo": "Dado"},
+
+    "status_faturamento": {"rotulo": "status de faturamento", "aliases": ["Status Faturamento"], "prefixo": None},
+
+    "departamento": {"rotulo": "departamento", "aliases": ["Departamento"], "prefixo": "Dado"},
+
+}
+
+# Cabeçalhos cuja informação de linha/valor deve ser tratada como sensível.
+# A lista é normalizada para aceitar diferenças de acento, caixa e espaços.
+COLUNAS_SENSIVEIS = {
+    normalizar(nome) for nome in (
+        "Classe Produto", "Cliente Gerencial", "Grupo Empresarial", "Empresa",
+        "Nº Pedido", "No Pedido", "Numero Pedido", "Data Pedido", "CNPJ",
+        "Cliente", "Produto", "N.F.", "NF", "Representante", "Departamento",
+        "Vendedor atual do cadastro", "Gerente região Venda",
+        "Gerente região Cadastro", "Parceiro Matriz", "CNPJ Matriz",
+        "Validação Venda", "Vendedor",
+    )
+}
+
+# Data Pedido pode ser usada para cálculo local, mas não deve expor o dia exato ao Gemini.
+def _data_pedido_sensivel(cols):
+    origem = cols.get("data")
+    return bool(origem and normalizar(origem) in {normalizar("Data Pedido")})
+
+TEMPO_AGRUPAR = ["ano", "trimestre", "mes", "dia"]
+
+FILTROS_TEMPO = ["ano", "trimestre_do_ano", "mes_do_ano"]
+
+OPERADORES = {"igual": "igual", "contem": "contem", "diferente": "diferente", "=": "igual", "!=": "diferente"}
+
+METRICA_SINONIMOS = {
+
+    "valor": "faturamento", "vendas": "faturamento", "valor_total": "faturamento",
+
+    "qtde": "quantidade", "qtd": "quantidade", "preco": "preco_medio", "preco_medio_unitario": "preco_medio",
+
+    "linhas": "registros",
+
+}
+
+PLACEHOLDERS = {"(nao informado)", "(sem informacao)"}
+
+REGEX_PSEUDONIMO = re.compile(r"^(cliente|vendedor|representante|gerente|dado) \d+$")
+
+REGEX_PSEUDONIMO_TEXTO = re.compile(r"(?<!\w)(Cliente|Vendedor|Representante|Gerente|Dado) (\d+)(?!\w)", re.IGNORECASE)
+
+def resolver_colunas(df, explicitas):
+
+    """Descobre as colunas de cada dimensão. Parâmetros explícitos têm prioridade; senão, nomes padrão."""
+
+    cols = {}
+
+    for dim, cfg in DIMENSOES_TEXTO.items():
+
+        explicita = explicitas.get(dim)
+
+        achada = localizar_coluna_opcional(df, [explicita]) if explicita else None
+
+        cols[dim] = achada or localizar_coluna_opcional(df, cfg["aliases"])
+
+    for dim in ("representante", "vendedor_cadastro"):  # não duplicar a coluna de vendedor
+
+        if cols[dim] and cols[dim] == cols["vendedor"]:
+
+            cols[dim] = None
+
+    ev = explicitas.get("valor")
+
+    cols["valor"] = (localizar_coluna_opcional(df, [ev]) if ev else None) or localizar_coluna_opcional(
+
+        df, ["Vlr total dos produtos", "Valor Total (Sem IPI)", "Valor Bruto da NF"]
+
+    )
+
+    eq = explicitas.get("qtd")
+
+    cols["qtd"] = (localizar_coluna_opcional(df, [eq]) if eq else None) or localizar_coluna_opcional(df, ["Qtde", "Quantidade"])
+
+    ed = explicitas.get("data")
+
+    cols["data"] = (localizar_coluna_opcional(df, [ed]) if ed else None) or localizar_coluna_opcional(
+
+        df, ["Data Faturamento", "Data Pedido"]
+
+    )
+
+    # Disponibiliza todas as demais colunas sem enviar valores brutos de campos sensíveis.
+    reservadas = {v for k, v in cols.items() if isinstance(v, str) and not k.startswith("_")}
+    dinamicas, prefixos_sensiveis, numericas = {}, {}, {}
+    for indice, nome in enumerate(df.columns, start=1):
+        if nome in reservadas:
+            continue
+        chave = f"campo_{indice}"
+        dinamicas[chave] = nome
+        cab = normalizar(nome)
+        termos_sensiveis = (
+            "cliente", "pessoa", "nome", "cpf", "cnpj", "documento", "email", "e-mail",
+            "telefone", "celular", "contato", "endereco", "responsavel", "vendedor",
+            "representante", "gerente", "usuario", "login", "matricula", "chave pix",
+            "banco", "agencia", "conta bancaria", "pedido", "parceiro", "validacao",
+            "classe produto", "grupo empresarial", "data pedido", "nf", "n.f.",
+            "sku", "codigo sku", "código sku", "codigo produto", "código produto",
+        )
+        if cab in COLUNAS_SENSIVEIS or any(termo in cab for termo in termos_sensiveis):
+            prefixos_sensiveis[chave] = "Dado"
+        serie = df[nome]
+        if pd.api.types.is_numeric_dtype(serie) and not pd.api.types.is_bool_dtype(serie):
+            numericas[chave] = nome
+    cols["_dinamicas"] = dinamicas
+    cols["_prefixos_sensiveis"] = prefixos_sensiveis
+    cols["_numericas"] = numericas
+    return cols
+
+# ============================================================
+
+# PSEUDÔNIMOS (consistentes durante a conversa)
+
+# ============================================================
+
+def _pseudonimo(mapa, prefixo, nome):
+
+    """Devolve 'Prefixo N' para o nome, criando o identificador se ainda não existir."""
+
+    if normalizar(nome) in PLACEHOLDERS:
+
+        return nome
+
+    grupo = mapa.setdefault(prefixo, {})
+
+    if nome not in grupo:
+
+        grupo[nome] = len(grupo) + 1
+
+    return f"{prefixo} {grupo[nome]}"
+
+def _mapa_reverso(mapa):
+
+    """{'cliente 3': 'NOME REAL'}"""
+
+    reverso = {}
+
+    for prefixo, nomes in mapa.items():
+
+        for nome, numero in nomes.items():
+
+            reverso[normalizar(f"{prefixo} {numero}")] = nome
+
+    return reverso
+
+def desanonimizar(texto, mapa):
+
+    """Troca 'Cliente 3', 'Vendedor 1'... pelos nomes reais, localmente."""
+
+    reverso = _mapa_reverso(mapa)
+
+    if not reverso:
+
+        return str(texto)
+
+    def trocar(m):
+
+        return reverso.get(normalizar(f"{m.group(1)} {m.group(2)}"), m.group(0))
+
+    return REGEX_PSEUDONIMO_TEXTO.sub(trocar, str(texto))
+
+def anonimizar_pergunta(pergunta, nomes_por_prefixo, mapa):
+
+    """Troca, na pergunta, nomes de clientes/vendedores/etc. por identificadores genéricos.
+
+    A busca ignora acentos e maiúsculas. Retorna (pergunta_segura, [(nome, identificador)]).
+
+    """
+
+    pergunta_segura = str(pergunta)
+
+    pn = _normalizar_posicional(pergunta_segura)
+
+    candidatos, vistos = [], set()
+
+    for prefixo in ("Cliente", "Vendedor", "Representante", "Gerente", "Dado"):
+
+        for nome in nomes_por_prefixo.get(prefixo, ()):
+
+            nome = str(nome).strip()
+
+            if len(nome) >= 2 and nome not in vistos and normalizar(nome) not in PLACEHOLDERS:
+
+                vistos.add(nome)
+
+                candidatos.append((nome, prefixo))
+
+    candidatos.sort(key=lambda item: len(item[0]), reverse=True)
+
+    substituicoes = []
+
+    for nome, prefixo in candidatos:
+
+        nn = _normalizar_posicional(nome)
+
+        if nn not in pn:
+
+            continue
+
+        padrao = re.compile(r"(?<!\w)" + re.escape(nn) + r"(?!\w)")
+
+        while True:
+
+            m = padrao.search(pn)
+
+            if not m:
+
+                break
+
+            indice = next((i for i, (n, _) in enumerate(substituicoes) if n == nome), None)
+
+            if indice is None:
+
+                substituicoes.append((nome, prefixo))
+
+                indice = len(substituicoes) - 1
+
+            marcador = f"__ent_{indice}__"
+
+            ini, fim = m.span()
+
+            pergunta_segura = pergunta_segura[:ini] + marcador + pergunta_segura[fim:]
+
+            pn = pn[:ini] + marcador + pn[fim:]
+
+    # Filtros de privacidade adicionais
+
+    pergunta_segura = re.sub(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b", "[EMAIL_REMOVIDO]", pergunta_segura)
+
+    pergunta_segura = re.sub(r"(?<!\d)\d{3}\.?\d{3}\.?\d{3}-?\d{2}(?!\d)", "[DOCUMENTO_REMOVIDO]", pergunta_segura)
+
+    pergunta_segura = re.sub(r"(?<!\d)\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}(?!\d)", "[DOCUMENTO_REMOVIDO]", pergunta_segura)
+
+    # Telefone: exige DDD (parênteses ou espaço) ou hífen, para não apagar "2025 2026".
+
+    pergunta_segura = re.sub(
+
+        r"(?<!\d)(?:\+?55\s*)?(?:\(\d{2}\)\s*|\d{2}\s+)9?\d{4}[-.\s]?\d{4}(?!\d)",
+
+        "[TELEFONE_REMOVIDO]", pergunta_segura,
+
+    )
+
+    pergunta_segura = re.sub(r"(?<!\d)9?\d{4}-\d{4}(?!\d)", "[TELEFONE_REMOVIDO]", pergunta_segura)
+
+    encontrados = []
+
+    for indice, (nome, prefixo) in enumerate(substituicoes):
+
+        identificador = _pseudonimo(mapa, prefixo, nome)
+
+        pergunta_segura = pergunta_segura.replace(f"__ent_{indice}__", identificador)
+
+        encontrados.append((nome, identificador))
+
+    return pergunta_segura, encontrados
+
+# ============================================================
+
+# QUADRO DE DADOS LOCAL
+
+# ============================================================
+
+class Quadro:
+
+    """Tabela enxuta (valor, quantidade, data) com colunas de dimensão criadas sob demanda."""
+
+    def __init__(self, df, cols):
+
+        self._df = df
+
+        self.cols = cols
+
+        self.tab = pd.DataFrame({"v": _valores(df[cols["valor"]]).to_numpy()})
+
+        if cols.get("qtd"):
+
+            self.tab["q"] = _valores(df[cols["qtd"]]).to_numpy()
+
+        for chave, origem in cols.get("_numericas", {}).items():
+            self.tab[f"n_{chave}"] = _valores(df[origem]).to_numpy()
+
+        self.tem_data = False
+
+        if cols.get("data"):
+
+            datas = pd.to_datetime(df[cols["data"]], errors="coerce", dayfirst=True).dt.normalize()
+
+            if datas.notna().any():
+
+                self.tab["d"] = datas.to_numpy()
+
+                self.tem_data = True
+
+    @property
+
+    def tem_quantidade(self):
+
+        return "q" in self.tab.columns
+
+    def coluna(self, dim):
+
+        """Garante e devolve o nome da coluna de uma dimensão dentro de self.tab."""
+
+        chave = f"x_{dim}"
+
+        if chave in self.tab.columns:
+
+            return chave
+
+        if dim in DIMENSOES_TEXTO:
+
+            origem = self._df[self.cols[dim]]
+
+            self.tab[chave] = origem.fillna("(sem informação)").astype(str).str.strip().to_numpy()
+
+        elif dim in self.cols.get("_dinamicas", {}):
+
+            origem = self._df[self.cols["_dinamicas"][dim]]
+            valores = origem.fillna("(sem informação)").astype(str).str.strip()
+            self.tab[chave] = valores.to_numpy()
+
+        elif dim == "ano":
+
+            self.tab[chave] = self.tab["d"].dt.year.astype("Int64")
+
+        elif dim == "trimestre":
+
+            d = self.tab["d"]
+
+            self.tab[chave] = (d.dt.year.astype("Int64").astype(str) + "-T" + d.dt.quarter.astype("Int64").astype(str)).where(d.notna())
+
+        elif dim == "mes":
+
+            self.tab[chave] = self.tab["d"].dt.strftime("%Y-%m")
+
+        elif dim == "dia":
+
+            self.tab[chave] = self.tab["d"].dt.strftime("%Y-%m-%d")
+
+        else:
+
+            raise ValueError(f"dimensão desconhecida: {dim}")
+
+        return chave
+
+def nomes_para_anonimizar(quadro):
+
+    """{'Cliente': {nomes}, 'Vendedor': {...}} com os nomes reais presentes nos dados."""
+
+    saida = {}
+
+    for dim, cfg in DIMENSOES_TEXTO.items():
+
+        prefixo = cfg["prefixo"]
+
+        if prefixo and quadro.cols.get(dim):
+
+            valores = quadro._df[quadro.cols[dim]].dropna().astype(str).str.strip().unique()
+
+            saida.setdefault(prefixo, set()).update(valores)
+
+    for dim, prefixo in quadro.cols.get("_prefixos_sensiveis", {}).items():
+        origem = quadro.cols.get("_dinamicas", {}).get(dim)
+        if origem:
+            valores = quadro._df[origem].dropna().astype(str).str.strip().unique()
+            saida.setdefault(prefixo, set()).update(valores)
+    return saida
+
+def montar_esquema(quadro):
+
+    """Descrição dos dados enviada ao planejador. Não contém linhas nem nomes de pessoas/clientes."""
+
+    cols = quadro.cols
+
+    esquema = {
+
+        "hoje": datetime.now().strftime("%Y-%m-%d"),
+
+        "total_de_registros": int(len(quadro.tab)),
+
+    }
+
+    if quadro.tem_data:
+
+        if _data_pedido_sensivel(cols):
+            esquema["periodo_dos_dados"] = {
+                "primeiro_mes": quadro.tab["d"].min().strftime("%Y-%m"),
+                "ultimo_mes": quadro.tab["d"].max().strftime("%Y-%m"),
+                "observacao": "Data Pedido é sensível; exibir datas somente por mês, nunca dia exato.",
+            }
+        else:
+            esquema["periodo_dos_dados"] = {
+                "primeira_data": quadro.tab["d"].min().strftime("%Y-%m-%d"),
+                "ultima_data": quadro.tab["d"].max().strftime("%Y-%m-%d"),
+            }
+
+    else:
+
+        esquema["periodo_dos_dados"] = "sem coluna de data válida: não há dimensões nem filtros de tempo"
+
+    dims = {}
+
+    valores_possiveis = {}
+
+    for dim, cfg in DIMENSOES_TEXTO.items():
+
+        if not cols.get(dim):
+
+            continue
+
+        descricao = cfg["rotulo"]
+
+        if cfg["prefixo"]:
+
+            descricao += f' (valores aparecem como "{cfg["prefixo"]} N")'
+
+        dims[dim] = descricao
+
+        if not cfg["prefixo"] and dim != "produto":
+
+            unicos = quadro._df[cols[dim]].dropna().astype(str).str.strip().unique().tolist()
+
+            valores_possiveis[dim] = sorted(unicos)[:MAX_VALORES_LISTADOS] if len(unicos) <= MAX_VALORES_LISTADOS else f"{len(unicos)} valores distintos"
+
+    for dim, origem in cols.get("_dinamicas", {}).items():
+        prefixo = cols.get("_prefixos_sensiveis", {}).get(dim)
+        dims[dim] = f"coluna {origem!r} (use o ID {dim})" + (f' (valores pseudonimizados como "{prefixo} N")' if prefixo else "")
+        serie = quadro._df[origem].dropna().astype(str).str.strip()
+        unicos = serie.unique().tolist()
+        if prefixo:
+            valores_possiveis[dim] = f"{len(unicos)} valores distintos, pseudonimizados; use o identificador citado na pergunta"
+        elif len(unicos) <= MAX_VALORES_LISTADOS:
+            valores_possiveis[dim] = [sanitizar_valor_textual(v) for v in unicos]
+        else:
+            valores_possiveis[dim] = f"{len(unicos)} valores distintos"
+
+    esquema["dimensoes_texto_para_agrupar_e_filtrar"] = dims
+
+    if quadro.tem_data:
+
+        tempos_disponiveis = [t for t in TEMPO_AGRUPAR if not (_data_pedido_sensivel(cols) and t == "dia")]
+        esquema["dimensoes_de_tempo_para_agrupar"] = tempos_disponiveis
+
+        esquema["filtros_de_tempo"] = {"ano": "ex.: 2026", "trimestre_do_ano": "1 a 4", "mes_do_ano": "1 a 12"}
+        if _data_pedido_sensivel(cols):
+            esquema["regra_privacidade_data"] = "Data Pedido é sensível: não retorne dias exatos nem datas de primeira/última compra; use mês, trimestre ou ano."
+
+    esquema["valores_possiveis"] = valores_possiveis
+
+    metricas = {"faturamento": "soma do valor faturado", "registros": "número de linhas"}
+
+    if quadro.tem_quantidade:
+
+        metricas["quantidade"] = "soma das quantidades"
+
+        metricas["preco_medio"] = "faturamento ÷ quantidade (média ponderada)"
+
+    if cols.get("cliente"):
+
+        metricas["clientes_distintos"] = "número de clientes diferentes"
+
+    if cols.get("produto"):
+
+        metricas["produtos_distintos"] = "número de produtos diferentes"
+
+    if quadro.tem_data and not _data_pedido_sensivel(cols):
+
+        metricas["data_primeira"] = "primeira data"
+
+        metricas["data_ultima"] = "última data"
+
+    for dim, origem in cols.get("_numericas", {}).items():
+        metricas[f"soma_{dim}"] = f"soma da coluna numérica {origem!r} (ID {dim})"
+        metricas[f"media_{dim}"] = f"média da coluna numérica {origem!r} (ID {dim})"
+    esquema["metricas"] = metricas
+
+    esquema["operadores_de_filtro"] = ["igual", "contem", "diferente"]
+
+    return esquema
+
+# ============================================================
+
+# VALIDAÇÃO DO PLANO (nada vindo da IA é executado sem passar por aqui)
+
+# ============================================================
+
+def _lista(x):
+
+    if x is None:
+
+        return []
+
+    return list(x) if isinstance(x, (list, tuple)) else [x]
+
+def _chave(x):
+
+    return normalizar(x).replace(" ", "_")
+
+def _validar_consulta(c, dims_agrupar, filtros_validos, metricas_validas, tem_data):
+
+    agrupar = []
+
+    for d in _lista(c.get("agrupar_por")):
+
+        d = _chave(d)
+
+        if d not in dims_agrupar:
+
+            raise ValueError(f"agrupamento por '{d}' indisponível nos dados")
+
+        if d not in agrupar:
+
+            agrupar.append(d)
+
+    if len(agrupar) > 3:
+
+        raise ValueError("agrupamentos demais (máximo 3)")
+
+    metricas = []
+
+    for m in _lista(c.get("metricas")):
+
+        m = _chave(m)
+
+        m = METRICA_SINONIMOS.get(m, m)
+
+        if m not in metricas_validas:
+
+            raise ValueError(f"métrica '{m}' indisponível nos dados")
+
+        if m not in metricas:
+
+            metricas.append(m)
+
+    if not metricas:
+
+        metricas = ["faturamento"]
+
+    filtros = []
+
+    for f in _lista(c.get("filtros")):
+
+        if not isinstance(f, dict):
+
+            raise ValueError("filtro inválido")
+
+        dim = _chave(f.get("dimensao") or "")
+
+        if dim not in filtros_validos:
+
+            raise ValueError(f"filtro por '{dim}' indisponível nos dados")
+
+        op = OPERADORES.get(_chave(f.get("operador") or "igual"))
+
+        if op is None:
+
+            raise ValueError("operador de filtro inválido")
+
+        valores = [v for v in _lista(f.get("valores", f.get("valor"))) if isinstance(v, (str, int, float)) and str(v).strip() != ""][:20]
+
+        if not valores:
+
+            raise ValueError(f"filtro de '{dim}' sem valores")
+
+        if dim in FILTROS_TEMPO:
+
+            try:
+
+                valores = [int(float(v)) for v in valores]
+
+            except (TypeError, ValueError):
+
+                raise ValueError(f"valores inválidos para o filtro '{dim}'")
+
+        filtros.append({"dimensao": dim, "operador": op, "valores": valores})
+
+    periodo = None
+
+    p = c.get("periodo")
+
+    if p:
+
+        if not tem_data:
+
+            raise ValueError("a base não tem coluna de data para filtrar período")
+
+        if not isinstance(p, dict):
+
+            raise ValueError("período inválido")
+
+        periodo = {}
+
+        for campo in ("inicio", "fim"):
+
+            if p.get(campo):
+
+                data = pd.to_datetime(p.get(campo), errors="coerce")
+
+                if pd.isna(data):
+
+                    raise ValueError(f"data de {campo} do período inválida")
+
+                periodo[campo] = data.strftime("%Y-%m-%d")
+
+        periodo = periodo or None
+
+    ultima = bool(c.get("somente_ultima_data"))
+
+    if ultima:
+
+        if not tem_data:
+
+            raise ValueError("última data exige coluna de data")
+
+        if "data_ultima" not in metricas:
+
+            metricas.append("data_ultima")
+
+    ordenar = _chave(c["ordenar_por"]) if c.get("ordenar_por") else None
+
+    if ordenar not in set(agrupar) | set(metricas):
+
+        ordenar = None
+
+    direcao = _chave(c.get("direcao") or "")
+
+    direcao = "asc" if direcao in {"asc", "crescente"} else "desc" if direcao in {"desc", "decrescente"} else None
+
+    try:
+
+        limite = int(c.get("limite") or LIMITE_PADRAO)
+
+    except (TypeError, ValueError):
+
+        limite = LIMITE_PADRAO
+
+    limite = max(1, min(limite, LIMITE_MAXIMO))
+
+    return {
+
+        "descricao": str(c.get("descricao") or "")[:200],
+
+        "agrupar_por": agrupar, "metricas": metricas, "filtros": filtros, "periodo": periodo,
+
+        "somente_ultima_data": ultima, "ordenar_por": ordenar, "direcao": direcao, "limite": limite,
+
+    }
+
+def validar_plano(bruto, cols, tem_data):
+
+    """Valida o JSON do planejador. Retorna (consultas_validas, avisos, esclarecimento)."""
+
+    if not isinstance(bruto, dict):
+
+        raise ValueError("o planejador não devolveu um objeto JSON")
+
+    esclarecimento = bruto.get("esclarecimento")
+
+    esclarecimento = esclarecimento.strip() if isinstance(esclarecimento, str) and esclarecimento.strip() else None
+
+    dims_texto = {d for d in DIMENSOES_TEXTO if cols.get(d)} | set(cols.get("_dinamicas", {}))
+
+    tempos_permitidos = set(TEMPO_AGRUPAR)
+    if _data_pedido_sensivel(cols):
+        tempos_permitidos.discard("dia")
+    dims_agrupar = dims_texto | (tempos_permitidos if tem_data else set())
+
+    filtros_validos = dims_texto | (set(FILTROS_TEMPO) if tem_data else set())
+
+    metricas_validas = {"faturamento", "registros"}
+
+    if cols.get("qtd"):
+
+        metricas_validas |= {"quantidade", "preco_medio"}
+
+    if cols.get("cliente"):
+
+        metricas_validas.add("clientes_distintos")
+
+    if cols.get("produto"):
+
+        metricas_validas.add("produtos_distintos")
+
+    if tem_data and not _data_pedido_sensivel(cols):
+
+        metricas_validas |= {"data_primeira", "data_ultima"}
+    for dim in cols.get("_numericas", {}):
+        metricas_validas |= {f"soma_{dim}", f"media_{dim}"}
+
+    brutas = _lista(bruto.get("consultas"))
+
+    avisos, consultas = [], []
+
+    for i, c in enumerate(brutas[:MAX_CONSULTAS], start=1):
+
+        if not isinstance(c, dict):
+
+            continue
+
+        try:
+
+            consulta_validada = _validar_consulta(c, dims_agrupar, filtros_validos, metricas_validas, tem_data)
+            if _data_pedido_sensivel(cols):
+                # Defesa adicional: não permitir retorno de datas exatas mesmo se o modelo
+                # tentar solicitar explicitamente métricas de primeira/última data.
+                if "dia" in consulta_validada["agrupar_por"]:
+                    raise ValueError("agrupamento por dia bloqueado por privacidade de Data Pedido")
+                consulta_validada["metricas"] = [m for m in consulta_validada["metricas"] if m not in {"data_primeira", "data_ultima"}]
+            consultas.append(consulta_validada)
+
+        except ValueError as exc:
+
+            avisos.append(f"Consulta {i} ignorada: {exc}.")
+
+    if len(brutas) > MAX_CONSULTAS:
+
+        avisos.append(f"Só as {MAX_CONSULTAS} primeiras consultas foram executadas.")
+
+    return consultas, avisos, esclarecimento
+
+# ============================================================
+
+# EXECUÇÃO LOCAL DAS CONSULTAS
+
+# ============================================================
+
+def _mascara_filtro(quadro, filtro, reverso, avisos):
+
+    dim, op, valores = filtro["dimensao"], filtro["operador"], filtro["valores"]
+
+    tab = quadro.tab
+
+    if dim in FILTROS_TEMPO:
+
+        parte = {"ano": tab["d"].dt.year, "trimestre_do_ano": tab["d"].dt.quarter, "mes_do_ano": tab["d"].dt.month}[dim]
+
+        mascara = parte.isin(set(valores))
+
+        return (~mascara & tab["d"].notna()) if op == "diferente" else mascara
+
+    serie = tab[quadro.coluna(dim)]
+
+    prefixo = DIMENSOES_TEXTO.get(dim, {}).get("prefixo") or quadro.cols.get("_prefixos_sensiveis", {}).get(dim)
+
+    alvo = set()
+
+    for v in valores:
+
+        texto = normalizar(v)
+
+        if not texto:
+
+            continue
+
+        if prefixo:
+
+            real = reverso.get(texto)
+
+            if real is not None:
+
+                alvo.add(normalizar(real))
+
+                continue
+
+            if REGEX_PSEUDONIMO.match(texto):
+
+                avisos.append(f"Identificador desconhecido no filtro de {dim}: {v}.")
+
+                continue
+
+        alvo.add(texto)
+
+    normalizados = {u: normalizar(u) for u in serie.unique()}
+
+    if op == "contem":
+
+        ok = {u for u, n in normalizados.items() if any(a in n for a in alvo)}
+
+    else:
+
+        ok = {u for u, n in normalizados.items() if n in alvo}
+
+    mascara = serie.isin(ok)
+
+    return ~mascara if op == "diferente" else mascara
+
+def _json_valor(v):
+
+    if v is None or (not isinstance(v, str) and pd.isna(v)):
+
+        return None
+
+    if isinstance(v, pd.Timestamp):
+
+        return v.strftime("%d/%m/%Y")
+
+    if hasattr(v, "item"):
+
+        v = v.item()
+
+    if isinstance(v, float):
+
+        return round(v, 2)
+
+    return v
+
+def executar_consulta(quadro, consulta, mapa, limite_maximo=LIMITE_MAXIMO):
+
+    """Executa uma consulta validada no DataFrame local e devolve linhas agregadas (com pseudônimos)."""
+
+    tab = quadro.tab
+
+    agrupar, metricas, filtros = consulta["agrupar_por"], consulta["metricas"], consulta["filtros"]
+
+    avisos = []
+
+    reverso = _mapa_reverso(mapa)
+
+    # Cria antes todas as colunas que serão usadas (o recorte abaixo precisa delas).
+
+    for d in agrupar:
+
+        quadro.coluna(d)
+
+    if "clientes_distintos" in metricas:
+
+        quadro.coluna("cliente")
+
+    if "produtos_distintos" in metricas:
+
+        quadro.coluna("produto")
+
+    mascara = pd.Series(True, index=tab.index)
+
+    for f in filtros:
+
+        mascara &= _mascara_filtro(quadro, f, reverso, avisos)
+
+    usa_tempo = bool(
+
+        consulta["periodo"] or consulta["somente_ultima_data"]
+
+        or any(d in TEMPO_AGRUPAR for d in agrupar) or any(f["dimensao"] in FILTROS_TEMPO for f in filtros)
+
+    )
+
+    if consulta["periodo"]:
+
+        if consulta["periodo"].get("inicio"):
+
+            mascara &= tab["d"] >= pd.Timestamp(consulta["periodo"]["inicio"])
+
+        if consulta["periodo"].get("fim"):
+
+            mascara &= tab["d"] <= pd.Timestamp(consulta["periodo"]["fim"])
+
+    if usa_tempo:
+
+        mascara &= tab["d"].notna()
+
+    dados = tab[mascara]
+
+    totais = {"registros": int(len(dados)), "faturamento": round(float(dados["v"].sum()), 2)}
+
+    if quadro.tem_quantidade:
+
+        totais["quantidade"] = round(float(dados["q"].sum()), 2)
+
+    resultado = {
+
+        "descricao": consulta["descricao"], "agrupar_por": agrupar, "metricas": metricas,
+
+        "filtros": filtros, "periodo": consulta["periodo"], "somente_ultima_data": consulta["somente_ultima_data"],
+
+        "totais_do_filtro": totais, "avisos": avisos,
+
+    }
+
+    if dados.empty:
+
+        resultado.update({"linhas_totais": 0, "linhas_retornadas": 0, "truncado": False, "linhas": []})
+
+        return resultado
+
+    chaves = [quadro.coluna(d) for d in agrupar]
+
+    if consulta["somente_ultima_data"]:
+
+        nao_tempo = [quadro.coluna(d) for d in agrupar if d in DIMENSOES_TEXTO]
+
+        if nao_tempo:
+
+            dados = dados[dados["d"] == dados.groupby(nao_tempo, dropna=False)["d"].transform("max")]
+
+        else:
+
+            dados = dados[dados["d"] == dados["d"].max()]
+
+    dados = dados.copy()
+
+    spec = {"faturamento": ("v", "sum"), "registros": ("v", "size")}
+
+    if quadro.tem_quantidade:
+
+        spec["quantidade"] = ("q", "sum")
+
+    if "clientes_distintos" in metricas:
+
+        dados["_cli_n"] = dados[quadro.coluna("cliente")]
+
+        spec["clientes_distintos"] = ("_cli_n", "nunique")
+
+    if "produtos_distintos" in metricas:
+
+        dados["_prod_n"] = dados[quadro.coluna("produto")]
+
+        spec["produtos_distintos"] = ("_prod_n", "nunique")
+
+    if "data_primeira" in metricas:
+
+        spec["data_primeira"] = ("d", "min")
+
+    if "data_ultima" in metricas:
+
+        spec["data_ultima"] = ("d", "max")
+
+    # Contagem de suporte calculada localmente para impedir a divulgação de grupos muito pequenos.
+    if chaves:
+        spec["_registros_privacidade"] = ("v", "size")
+
+    for dim, origem in quadro.cols.get("_numericas", {}).items():
+        coluna_n = f"n_{dim}"
+        if f"soma_{dim}" in metricas:
+            spec[f"soma_{dim}"] = (coluna_n, "sum")
+        if f"media_{dim}" in metricas:
+            spec[f"media_{dim}"] = (coluna_n, "mean")
+
+    if not chaves:
+
+        dados["_tudo"] = 0
+
+        chaves_agrupamento = ["_tudo"]
+
+    else:
+
+        chaves_agrupamento = chaves
+
+    agg = dados.groupby(chaves_agrupamento, dropna=False, sort=False).agg(**spec).reset_index()
+
+    if "preco_medio" in metricas:
+
+        agg["preco_medio"] = agg["faturamento"] / agg["quantidade"].where(agg["quantidade"] > 0)
+
+    if chaves:
+
+        agg = agg.rename(columns=dict(zip(chaves, agrupar)))
+        grupos_pequenos = agg["_registros_privacidade"] < MIN_REGISTROS_GRUPO
+        quantidade_grupos_ocultos = int(grupos_pequenos.sum())
+        if quantidade_grupos_ocultos:
+            agg = agg.loc[~grupos_pequenos].copy()
+            aviso_privacidade = (
+                f"Grupos com menos de {MIN_REGISTROS_GRUPO} registros foram ocultados por privacidade. "
+                "Os totais gerais também foram omitidos para evitar reconstrução por diferença."
+            )
+            avisos.append(aviso_privacidade)
+            resultado["avisos"] = avisos
+            resultado["totais_do_filtro"] = {
+                "aviso": "Totais gerais omitidos porque pelo menos um grupo foi ocultado por privacidade."
+            }
+        agg = agg.drop(columns=["_registros_privacidade"])
+
+    else:
+
+        agg = agg.drop(columns=["_tudo"])
+
+    # Ordenação: pedida pelo plano; senão cronológica (se agrupa por tempo) ou pela primeira métrica (maior primeiro).
+
+    if consulta["ordenar_por"] and consulta["ordenar_por"] in agg.columns:
+
+        agg = agg.sort_values(consulta["ordenar_por"], ascending=(consulta["direcao"] == "asc"), na_position="last", kind="stable")
+
+    elif any(d in TEMPO_AGRUPAR for d in agrupar):
+
+        agg = agg.sort_values(agrupar, ascending=True, kind="stable")
+
+    elif agrupar:
+
+        agg = agg.sort_values(metricas[0] if metricas[0] in agg.columns else "faturamento", ascending=False, na_position="last", kind="stable")
+
+    linhas_totais = int(len(agg))
+
+    limite = min(consulta["limite"], limite_maximo)
+
+    agg = agg.head(limite).copy()
+
+    for d in agrupar:  # pseudônimos só para o que realmente será devolvido
+
+        prefixo = DIMENSOES_TEXTO.get(d, {}).get("prefixo") or quadro.cols.get("_prefixos_sensiveis", {}).get(d)
+
+        if prefixo:
+
+            agg[d] = agg[d].map(lambda nome: _pseudonimo(mapa, prefixo, str(nome)))
+        else:
+            agg[d] = agg[d].map(sanitizar_valor_textual)
+
+    colunas = agrupar + [m for m in metricas if m in agg.columns]
+
+    agg = agg[colunas].astype(object)
+
+    resultado.update({
+
+        "linhas_totais": linhas_totais,
+
+        "linhas_retornadas": int(len(agg)),
+
+        "truncado": linhas_totais > len(agg),
+
+        "linhas": [{k: _json_valor(v) for k, v in linha.items()} for linha in agg.to_dict("records")],
+
+    })
+
+    return resultado
+
+# ============================================================
+
+# PROMPTS
+
+# ============================================================
+
+def _extrair_json(texto):
+
+    t = str(texto).strip()
+
+    t = re.sub(r"^```(?:json)?\s*|\s*```$", "", t, flags=re.MULTILINE).strip()
+
+    try:
+
+        return json.loads(t)
+
+    except json.JSONDecodeError:
+
+        ini, fim = t.find("{"), t.rfind("}")
+
+        if ini != -1 and fim > ini:
+
+            return json.loads(t[ini:fim + 1])
+
+        raise ValueError("a resposta do planejador não é um JSON válido")
+
+def montar_prompt_planejador(pergunta_segura, esquema, historico):
+
+    partes = ["Esquema dos dados disponíveis (JSON):\n" + json.dumps(esquema, ensure_ascii=False, indent=2)]
+
+    if historico:
+
+        partes.append(
+
+            "Histórico recente da conversa (anonimizado; use para resolver referências):\n"
+
+            + json.dumps(historico[-TURNOS_HISTORICO:], ensure_ascii=False, indent=2)
+
+        )
+
+    partes.append("Pergunta atual (anonimizada):\n" + pergunta_segura)
+
+    partes.append("Devolva apenas o JSON do plano de consultas.")
+
+    return "\n\n".join(partes)
+
+def montar_prompt_resposta(pergunta_segura, resultados, avisos, esquema):
+
+    pacote = {
+
+        "periodo_dos_dados_nos_filtros": esquema.get("periodo_dos_dados"),
+
+        "consultas_executadas": resultados,
+
+        "avisos_gerais": avisos,
+
+    }
+
+    return (
+
+        "Pergunta do usuário (anonimizada):\n" + pergunta_segura + "\n\n"
+
+        "Resultados calculados localmente (JSON):\n" + json.dumps(pacote, ensure_ascii=False, indent=2) + "\n\n"
+
+        "Responda usando somente esses resultados e siga as regras obrigatórias."
+
+    )
+
+# ============================================================
+
+# API (Gemini)
+
+# ============================================================
+
+def obter_chave_api():
+
+    try:
+
+        chave = st.secrets["GEMINI_API_KEY"]
+
+    except Exception:
+
+        chave = None
+
+    return chave or os.environ.get("GEMINI_API_KEY")
+
+@st.cache_resource(show_spinner=False)
+
+def _criar_cliente(chave_api):
+
+    return genai.Client(api_key=chave_api)
+
+def consultar_gemini(prompt, chave_api, sistema=INSTRUCOES_IA, json_mode=False, temperatura=0.2):
+
+    cliente = _criar_cliente(chave_api)
+
+    config = types.GenerateContentConfig(
+
+        system_instruction=sistema,
+
+        temperature=temperatura,
+
+        response_mime_type="application/json" if json_mode else None,
+
+    )
+
+    resposta = None
+
+    for tentativa in range(3):
+
+        try:
+
+            resposta = cliente.models.generate_content(model=MODELO_GEMINI, contents=prompt, config=config)
+
+            break
+
+        except Exception as exc:
+
+            mensagem = str(exc).upper()
+
+            temporario = any(t in mensagem for t in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"))
+
+            if not temporario or tentativa == 2:
+
+                raise
+
+            time.sleep(2 ** (tentativa + 1))
+
+    texto = getattr(resposta, "text", None)
+
+    if not texto:
+
+        raise RuntimeError("A API não retornou texto (resposta vazia ou bloqueada).")
+
+    return texto
+
+# ============================================================
+
+# FLUXO EM DUAS REQUISIÇÕES (sem Streamlit: fácil de testar)
+
+# ============================================================
+
+def processar_pergunta(df, cols, pergunta, mapa, historico, gerar, etapa=None):
+
+    """Planeja -> executa localmente -> responde.
+
+    `gerar(prompt, sistema, json_mode)` faz a chamada ao modelo (injetada para permitir testes).
+
+    `etapa(texto)` é opcional e informa o andamento à interface.
+
+    Retorna dict com: resposta (nomes reais), resposta_segura, detalhes, memoria.
+
+    """
+
+    aviso_etapa = etapa or (lambda _t: None)
+
+    quadro = Quadro(df, cols)
+
+    pergunta_segura, _encontrados = anonimizar_pergunta(pergunta, nomes_para_anonimizar(quadro), mapa)
+
+    esquema = montar_esquema(quadro)
+
+    # Requisição 1: a IA decide quais dados precisa.
+
+    aviso_etapa("Entendendo a pergunta...")
+
+    texto_plano = gerar(montar_prompt_planejador(pergunta_segura, esquema, historico), INSTRUCOES_PLANEJADOR, True)
+
+    consultas, avisos, esclarecimento = validar_plano(_extrair_json(texto_plano), cols, quadro.tem_data)
+
+    detalhes = {"pergunta_enviada": pergunta_segura, "plano": consultas, "avisos": avisos}
+
+    if not consultas:
+
+        texto = esclarecimento or (
+
+            "Não consegui identificar quais dados consultar para essa pergunta com as colunas disponíveis. "
+
+            + " ".join(avisos)
+
+        ).strip()
+
+        return {
+
+            "resposta": desanonimizar(texto, mapa), "resposta_segura": texto, "detalhes": detalhes,
+
+            "memoria": {"pergunta": pergunta_segura, "consultas": [], "resposta": texto[:700]},
+
+        }
+
+    # Execução local (o código fornece os dados).
+
+    aviso_etapa("Consultando os dados...")
+
+    resultados, restante = [], MAX_LINHAS_TOTAIS
+
+    for consulta in consultas:
+
+        if restante <= 0:
+
+            avisos.append("Limite total de linhas atingido; algumas consultas não foram executadas.")
+
+            break
+
+        resultado = executar_consulta(quadro, consulta, mapa, limite_maximo=restante)
+
+        restante -= resultado.get("linhas_retornadas", 0)
+
+        resultados.append(resultado)
+
+    detalhes["resultados"] = resultados
+
+    # Requisição 2: a IA responde com os dados fornecidos.
+
+    aviso_etapa("Escrevendo a resposta...")
+
+    texto = gerar(montar_prompt_resposta(pergunta_segura, resultados, avisos, esquema), INSTRUCOES_IA, False)
+
+    return {
+
+        "resposta": desanonimizar(texto, mapa), "resposta_segura": texto, "detalhes": detalhes,
+
+        "memoria": {
+
+            "pergunta": pergunta_segura,
+
+            "consultas": [
+
+                {"descricao": c["descricao"], "agrupar_por": c["agrupar_por"], "metricas": c["metricas"],
+
+                 "filtros": c["filtros"], "periodo": c["periodo"], "somente_ultima_data": c["somente_ultima_data"]}
+
+                for c in consultas
+
+            ],
+
+            "resposta": texto[:700],
+
+        },
+
+    }
+
+# ============================================================
+
+# INTERFACE DO STREAMLIT
+
+# ============================================================
+
+def exibir_assistente_ia(
+
+    df_vendas=None,
+
+    coluna_cliente=None,
+
+    coluna_valor=None,
+
+    coluna_data=None,
+
+    coluna_produto=None,
+
+    coluna_quantidade=None,
+
+    coluna_vendedor=None,
+
+    coluna_segmento=None,
+
+    colunas_extras=None,
+
+    sufixo="",
+
+    **kwargs,
+
+):
+
+    """Desenha o assistente no contêiner atual.
+
+    Passe o DataFrame JÁ FILTRADO: o assistente só enxerga o que está nos filtros ativos.
+
+    `colunas_extras` aceita {"empresa": "...", "status_faturamento": "...", "departamento": "...",
+
+    "gerente_regiao": "...", "representante": "...", "vendedor_cadastro": "..."}; o que faltar é
+
+    procurado pelos nomes padrão do relatório. Apelidos antigos (df, col_valor, ...) continuam aceitos.
+
+    """
+
+    df_vendas = df_vendas if df_vendas is not None else kwargs.pop("df", None)
+
+    coluna_cliente = coluna_cliente or kwargs.pop("col_cliente", None)
+
+    coluna_valor = coluna_valor or kwargs.pop("col_valor", None)
+
+    coluna_data = coluna_data or kwargs.pop("col_data", None)
+
+    coluna_produto = coluna_produto or kwargs.pop("col_produto", None)
+
+    coluna_quantidade = coluna_quantidade or kwargs.pop("col_qtd", kwargs.pop("col_quantidade", None))
+
+    if df_vendas is None:
+
+        st.error("O assistente não recebeu o DataFrame de vendas.")
+
+        return
+
+    chave_msgs, chave_mem, chave_map = f"ia_mensagens_{sufixo}", f"ia_memoria_{sufixo}", f"ia_pseudonimos_{sufixo}"
+
+    st.session_state.setdefault(chave_msgs, [])
+
+    st.session_state.setdefault(chave_mem, [])
+
+    st.session_state.setdefault(chave_map, {})
+
+    st.subheader("🤖 Assistente de Vendas")
+
+    st.caption(
+
+        "A IA primeiro decide quais dados precisa; o painel calcula localmente e só então a IA responde. "
+
+        "Campos com possíveis dados pessoais são enviados como identificadores genéricos; os cálculos ocorrem localmente. "
+
+        "As respostas consideram os filtros ativos."
+
+    )
+
+    if st.button("🗑️ Limpar conversa", key=f"limpar_ia_{sufixo}"):
+
+        st.session_state[chave_msgs] = []
+
+        st.session_state[chave_mem] = []
+
+        st.session_state[chave_map] = {}
+
+        st.rerun()
+
+    with st.container(height=380, border=True):
+
+        if not st.session_state[chave_msgs]:
+
+            st.caption('Ex.: "Qual o preço médio do produto X por mês em 2026?"')
+
+        for mensagem in st.session_state[chave_msgs]:
+
+            with st.chat_message(mensagem["role"]):
+
+                st.markdown(mensagem["content"])
+
+                if mensagem.get("detalhes"):
+
+                    with st.expander("🔎 O que foi consultado"):
+
+                        st.caption("Plano e dados enviados ao Gemini (nomes substituídos por identificadores genéricos).")
+
+                        st.json(mensagem["detalhes"], expanded=False)
+
+    pergunta = st.chat_input("Pergunte sobre as vendas...", key=f"pergunta_ia_{sufixo}")
+
+    if not pergunta:
+
+        return
+
+    if df_vendas.empty:
+
+        st.warning("Não há dados de vendas nos filtros atuais.")
+
+        return
+
+    chave_api = obter_chave_api()
+
+    if not chave_api:
+
+        st.warning("Configure GEMINI_API_KEY (em .streamlit/secrets.toml ou como variável de ambiente).")
+
+        return
+
+    explicitas = {
+
+        "cliente": coluna_cliente, "produto": coluna_produto, "vendedor": coluna_vendedor,
+
+        "segmento": coluna_segmento, "valor": coluna_valor, "qtd": coluna_quantidade, "data": coluna_data,
+
+        **(colunas_extras or {}),
+
+    }
+
+    cols = resolver_colunas(df_vendas, {k: v for k, v in explicitas.items() if v})
+
+    if not cols.get("valor"):
+
+        st.error("Não localizei a coluna de valor. Informe coluna_valor ao chamar o assistente.")
+
+        return
+
+    def gerar(prompt, sistema, json_mode):
+
+        return consultar_gemini(prompt, chave_api, sistema=sistema, json_mode=json_mode, temperatura=0.0 if json_mode else 0.2)
+
+    try:
+
+        with st.spinner("Analisando..."):
+
+            saida = processar_pergunta(
+
+                df_vendas, cols, pergunta, st.session_state[chave_map], st.session_state[chave_mem], gerar
+
+            )
+
+    except Exception as exc:
+
+        st.error(f"Não foi possível obter a resposta do assistente: {exc}")
+
+        return
+
+    st.session_state[chave_msgs] = (st.session_state[chave_msgs] + [
+
+        {"role": "user", "content": pergunta},
+
+        {"role": "assistant", "content": saida["resposta"], "detalhes": saida["detalhes"]},
+
+    ])[-40:]
+
+    st.session_state[chave_mem] = (st.session_state[chave_mem] + [saida["memoria"]])[-TURNOS_HISTORICO * 2:]
+
+    st.rerun()

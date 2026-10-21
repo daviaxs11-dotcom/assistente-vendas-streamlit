@@ -1,0 +1,82 @@
+Guia de instalação dos pacotes — Painel de Vendas
+Este guia explica como preparar o computador para rodar o painel_vendas.py com o assistente de IA (assistente_ia.py). Os comandos são para Windows.
+1. O que você precisa antes
+• Python 3.10 ou mais novo (o painel foi usado com o Python 3.12). Para conferir, abra o Prompt de Comando e digite python --version.
+• Conexão com a internet na primeira instalação.
+• Os arquivos do projeto na mesma pasta (por exemplo, rel PY):
+    ◦ painel_vendas.py
+    ◦ assistente_ia.py
+    ◦ requirements.txt
+    ◦ Abrir Painel.bat
+Se o comando python --version não for reconhecido, instale o Python em python.org e marque a opção "Add Python to PATH" durante a instalação.
+2. Pacotes usados e para que servem
+• streamlit (versão 1.35 ou mais nova): cria a página do painel e permite clicar nos gráficos e tabelas.
+• pandas (versão 2.2 ou mais nova): lê e calcula os dados de vendas.
+• plotly: desenha os gráficos.
+• openpyxl: lê planilhas .xlsx e .xlsm.
+• xlrd: lê planilhas antigas .xls.
+• python-calamine: leitor de Excel mais rápido. É opcional; sem ele o painel usa o leitor padrão.
+• google-genai: conecta o assistente de IA ao Gemini.
+• msoffcrypto-tool (opcional): abre planilhas Excel protegidas por senha.
+3. Instalação automática (recomendada)
+1. Coloque o Abrir Painel.bat na pasta do projeto.
+2. Dê dois cliques nele.
+Na primeira vez, o arquivo cria o ambiente virtual (.venv), instala os pacotes e abre o painel. Nas próximas vezes ele só confere se está tudo instalado e abre o painel.
+4. Instalação manual
+Use este caminho se preferir instalar por conta própria ou se a instalação automática falhar.
+Passo 1 — abrir o Prompt de Comando na pasta do projeto
+No Explorador de Arquivos, abra a pasta do projeto, clique na barra de endereço, digite cmd e tecle Enter.
+Passo 2 — criar o ambiente virtual (só na primeira vez)
+python -m venv .venv
+Passo 3 — ativar o ambiente virtual
+.venv\Scripts\activate.bat
+Quando der certo, o texto (.venv) aparece no começo da linha.
+Passo 4 — instalar os pacotes
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+Sem o arquivo requirements.txt, instale diretamente:
+python -m pip install streamlit pandas plotly openpyxl xlrd python-calamine google-genai
+Passo 5 — abrir o painel
+python -m streamlit run painel_vendas.py
+5. Conteúdo do requirements.txt
+streamlit>=1.35
+pandas>=2.2
+plotly>=5.20
+openpyxl>=3.1
+xlrd>=2.0.1
+python-calamine>=0.2
+google-genai>=1.0
+
+# Opcional: abrir planilhas Excel protegidas por senha
+# msoffcrypto-tool
+Para usar o pacote opcional, apague o # da linha msoffcrypto-tool e rode a instalação de novo, ou instale direto com python -m pip install msoffcrypto-tool.
+6. Configurar a chave do Gemini
+O assistente de IA precisa de uma chave de API do Google AI Studio.
+1. Dentro da pasta do projeto, crie uma pasta chamada .streamlit.
+2. Dentro dela, crie um arquivo chamado secrets.toml com este conteúdo:
+GEMINI_API_KEY = "cole-sua-chave-aqui"
+3. Salve e reinicie o painel.
+Não escreva a chave dentro do .bat nem dentro dos arquivos .py, e não compartilhe o arquivo secrets.toml. Sem a chave, o painel funciona normalmente; só o assistente de IA fica indisponível.
+Opcionalmente, o modelo do Gemini pode ser trocado definindo a variável de ambiente GEMINI_MODEL.
+7. Configurar arquivos grandes (opcional)
+Por padrão o painel aceita arquivos de até 200 MB. Para aumentar, crie o arquivo .streamlit\config.toml com:
+[server]
+maxUploadSize = 1000
+O valor é em MB. Reinicie o painel depois de salvar.
+8. Como conferir se está tudo instalado
+Com o ambiente virtual ativado, rode:
+python -c "import streamlit, pandas, plotly, openpyxl, google.genai; print('Tudo certo')"
+Se aparecer Tudo certo, os pacotes principais estão instalados. Para ver as versões instaladas:
+python -m pip list
+9. Problemas comuns
+"python não é reconhecido como comando" O Python não está no PATH. Reinstale marcando "Add Python to PATH", ou use py -m venv .venv no lugar de python -m venv .venv.
+"A execução de scripts foi desabilitada neste sistema" (PowerShell) Use o Prompt de Comando (cmd) em vez do PowerShell, ou ative com .venv\Scripts\activate.bat.
+ModuleNotFoundError: No module named ... O pacote não está instalado neste ambiente virtual. Ative o .venv e rode python -m pip install -r requirements.txt. Confirme que o painel está sendo aberto pelo mesmo ambiente.
+Erro "Can't find workbook in OLE2 compound document" A planilha provavelmente está protegida por senha ou criptografada. Abra no Excel, remova a proteção e salve de novo como .xlsx ou .csv.
+Erro ao instalar python-calamine Ele é opcional. Remova a linha do requirements.txt e instale o resto; o painel usa o leitor padrão do Excel.
+A página não abre no navegador Copie o endereço mostrado na janela preta (normalmente http://localhost:8501) e cole no navegador. Se a porta estiver ocupada, feche outras janelas do painel.
+Mensagem de que o assistente não tem chave Confira se o arquivo .streamlit\secrets.toml está na mesma pasta do painel_vendas.py e se o nome da linha é exatamente GEMINI_API_KEY.
+9.1. Atualizar os pacotes
+Com o ambiente virtual ativado:
+python -m pip install --upgrade -r requirements.txt
+Se algo parar de funcionar depois de uma atualização, apague a pasta .venv e abra o Abrir Painel.bat novamente para recriar o ambiente do zero.
