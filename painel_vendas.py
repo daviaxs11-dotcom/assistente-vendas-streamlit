@@ -8,6 +8,8 @@ import html
 import io
 import re
 import unicodedata
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -98,18 +100,85 @@ def moeda(valor):
     return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
-def formatar_eixos(fig, eixo_y=None):
+def num_br(valor):
+    """Inteiro no padrão brasileiro: 2853420 -> 2.853.420."""
+    try:
+        return f"{valor:,.0f}".replace(",", ".")
+    except (TypeError, ValueError):
+        return str(valor)
+
+
+def pct_br(valor, casas=1):
+    return f"{valor:.{casas}f}%".replace(".", ",")
+
+
+def rotulo_moeda_curta(v):
+    if v >= 1_000_000:
+        return f"R$ {v / 1_000_000:.1f} M".replace(".", ",")
+    if v >= 1_000:
+        return f"R$ {v / 1_000:.0f} mil"
+    return "R$ 0" if v == 0 else f"R$ {v:.0f}"
+
+
+def rotulo_eixo_curto(v):
+    """0, 1M, 200 mil… (para eixos cujo título já traz a unidade)."""
+    if v == 0:
+        return "0"
+    if v >= 1_000_000:
+        return f"{v / 1_000_000:g}M".replace(".", ",")
+    if v >= 1_000:
+        return f"{v / 1_000:g} mil".replace(".", ",")
+    return f"{v:g}".replace(".", ",")
+
+
+def ticks_moeda_br(vmax, alvo=5, rotulador=None):
+    """(valores, rótulos) de eixo com números 'redondos' e rótulos em pt-BR."""
+    if not vmax or vmax <= 0:
+        return None, None
+    bruto = vmax / alvo
+    mag = 10 ** np.floor(np.log10(bruto))
+    passo = next(m * mag for m in (1, 2, 2.5, 5, 10) if bruto <= m * mag)
+    n = int(np.ceil(vmax / passo))
+    vals = [float(i * passo) for i in range(n + 1)]
+    return vals, [(rotulador or rotulo_moeda_curta)(v) for v in vals]
+
+
+PALETA_GRAFICOS = ["#ed1c24", "#8b929c", "#e8505a", "#7d0f17", "#5f6670", "#b85c63"]
+COR_TEXTO_GRAFICO = "#e8eaed"
+
+
+def padronizar_grafico(fig, altura=None, margem=None, legenda=False):
+    """Layout único para TODOS os gráficos (dashboard e análises detalhadas)."""
     fig.update_layout(
         template="plotly_dark",
-        margin=dict(l=20, r=20, t=55, b=20),
-        legend_title_text="",
-        hovermode="x unified",
+        colorway=PALETA_GRAFICOS,
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(family="Inter, sans-serif", color="#e8eaed"),
-        xaxis=dict(gridcolor="#292f35", zerolinecolor="#41474e"),
-        yaxis=dict(gridcolor="#292f35", zerolinecolor="#41474e"),
+        font=dict(family="Inter, sans-serif", color=COR_TEXTO_GRAFICO, size=10),
+        title=dict(font=dict(size=13, color="#f6f7f8"), x=0, xanchor="left"),
+        legend_title_text="",
+        showlegend=legenda,
+        hoverlabel=dict(bgcolor="#101316", font_color="#f6f6f6", bordercolor="#393f45"),
     )
+    if altura:
+        fig.update_layout(height=altura)
+    if margem:
+        fig.update_layout(margin=margem)
+    # Grade só no eixo dos valores: x nas barras horizontais, y nos demais gráficos.
+    horizontal = any(getattr(t, "orientation", None) == "h" for t in fig.data) or any(
+        getattr(t, "type", None) == "pie" for t in fig.data)
+    grade = dict(showgrid=True, gridcolor="rgba(140,150,160,.12)", zerolinecolor="rgba(140,150,160,.18)")
+    sem_grade = dict(showgrid=False, zeroline=False)
+    fig.update_xaxes(**(grade if horizontal else sem_grade), title_font_size=10, tickfont_size=9)
+    fig.update_yaxes(**(sem_grade if horizontal else grade), title_font_size=10, tickfont_size=9)
+    return fig
+
+
+def formatar_eixos(fig, eixo_y=None):
+    """Mantida por compatibilidade: aplica o mesmo layout do dashboard."""
+    tem_legenda = len(fig.data) > 1 and any(getattr(t, "name", None) for t in fig.data)
+    padronizar_grafico(fig, margem=dict(l=8, r=16, t=40, b=24), legenda=tem_legenda)
+    fig.update_layout(hovermode="x unified")
     if eixo_y:
         fig.update_yaxes(title=eixo_y, tickformat=",.2f")
     return fig
@@ -507,15 +576,95 @@ hr { border-color: var(--intech-line) !important; margin: .65rem 0 !important; }
 }
 .stButton > button:active { transform: translateY(0); }
 
-/* Faixa de navegação principal: seletor com a chave aba_ativa */
+
+/* ===== NAVEGAÇÃO PRINCIPAL ===== */
 div.st-key-aba_ativa [role="radiogroup"] {
-  display: flex;
-  gap: 4px;
-  padding: 5px;
-  background: linear-gradient(180deg, #090c0e, #07090a);
-  border: 1px solid rgba(160,170,180,.20);
-  border-radius: 12px;
-  box-shadow: inset 0 1px rgba(255,255,255,.025), 0 6px 18px rgba(0,0,0,.15);
+    display: flex !important;
+    flex-wrap: nowrap !important;
+    align-items: stretch !important;
+    gap: 5px !important;
+    padding: 6px !important;
+    background: linear-gradient(180deg, #090c0e, #07090a) !important;
+    border: 1px solid rgba(160,170,180,.20) !important;
+    border-radius: 12px !important;
+    box-shadow:
+        inset 0 1px rgba(255,255,255,.025),
+        0 6px 18px rgba(0,0,0,.18) !important;
+}
+
+/* ===== BOTÕES ===== */
+div.st-key-aba_ativa [role="radiogroup"] > label {
+    flex: 1 1 0 !important;
+    min-width: 0 !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    padding: 11px 10px !important;
+    margin: 0 !important;
+    background: #111417 !important;
+    border: 1px solid transparent !important;
+    border-radius: 8px !important;
+    cursor: pointer !important;
+    transition: background .2s ease,
+                border-color .2s ease,
+                box-shadow .2s ease !important;
+}
+
+/* Textos */
+div.st-key-aba_ativa [role="radiogroup"] > label p {
+    color: #d9dde2 !important;
+    font-size: 12px !important;
+    font-weight: 600 !important;
+    line-height: 1.3 !important;
+    margin: 0 !important;
+    white-space: nowrap !important;
+}
+
+/* Hover */
+div.st-key-aba_ativa [role="radiogroup"] > label:hover {
+    background: #202326 !important;
+    border-color: rgba(229,9,25,.65) !important;
+}
+
+/* Aba selecionada */
+div.st-key-aba_ativa [role="radiogroup"] > label:has(input:checked) {
+    background: linear-gradient(135deg, #ed1728, #b80716) !important;
+    border-color: #f52b3b !important;
+    box-shadow: 0 3px 10px rgba(229,9,25,.25) !important;
+}
+
+/* Texto da aba selecionada */
+div.st-key-aba_ativa [role="radiogroup"] > label:has(input:checked) p {
+    color: #ffffff !important;
+    font-weight: 700 !important;
+}
+
+/* Indicador de seleção */
+div.st-key-aba_ativa [role="radiogroup"] input {
+    accent-color: #ffffff !important;
+}
+
+/* Remove espaçamento interno excessivo */
+div.st-key-aba_ativa [role="radiogroup"] > label > div {
+    gap: 6px !important;
+}
+
+/* Telas menores */
+@media (max-width: 1050px) {
+    div.st-key-aba_ativa [role="radiogroup"] {
+        flex-wrap: wrap !important;
+    }
+
+    div.st-key-aba_ativa [role="radiogroup"] > label {
+        flex: 1 1 30% !important;
+        padding: 10px 8px !important;
+    }
+
+    div.st-key-aba_ativa [role="radiogroup"] > label p {
+        font-size: 12px !important;
+        white-space: normal !important;
+        text-align: center !important;
+    }
 }
 div.st-key-aba_ativa [role="radiogroup"] label {
   flex: 1;
@@ -751,18 +900,126 @@ st.markdown(
     unsafe_allow_html=True,
 )
 st.markdown(
-    """<div class="intech-hero" style="display:flex;align-items:center;gap:10px;margin:-8px 0 18px;padding:0 0 14px;border-bottom:1px solid #292e33;">
-    <div style="width:4px;height:40px;background:#ed1c24;border-radius:3px;"></div>
-    <div><div style="font-size:clamp(1.35rem,2.2vw,2rem);font-weight:800;letter-spacing:-.04em;color:#fff;">Painel Interativo de <span style="color:#ed1c24;">Vendas</span></div>
-    <div style="font-size:.92rem;color:#b9bec3;">Acompanhe o desempenho comercial e descubra novas oportunidades.</div></div></div>""",
+    """
+    <style>
+    /* Remove o botão Deploy / menu do Streamlit, que sobrepunha o cabeçalho */
+    [data-testid="stToolbar"], [data-testid="stDeployButton"], [data-testid="stAppDeployButton"],
+    [data-testid="stMainMenu"], [data-testid="stStatusWidget"] { display:none !important; }
+    [data-testid="stHeader"] { background:transparent !important; height:0 !important; }
+
+    /* Abas: ocupam a largura toda, sem bolinha de rádio */
+    div.st-key-aba_ativa, div.st-key-aba_ativa [data-testid="stRadio"] { width:100% !important; }
+    div.st-key-aba_ativa [role="radiogroup"] { width:100% !important; display:flex !important; }
+    div.st-key-aba_ativa [role="radiogroup"] label { justify-content:center !important; }
+    div.st-key-aba_ativa [role="radiogroup"] label > *:not(input):not([data-testid="stMarkdownContainer"]):not(:has([data-testid="stMarkdownContainer"])) { display:none !important; }
+    div.st-key-aba_ativa [role="radiogroup"] label [data-testid="stMarkdownContainer"] { margin:0 !important; }
+
+    /* Ícones dos títulos de seção */
+    .dash-section-title { display:flex; align-items:center; margin-bottom:6px !important; }
+    .dash-section-title .dash-red {
+      display:inline-flex; align-items:center; justify-content:center; width:24px; height:24px; flex:0 0 24px;
+      border-radius:7px; background:rgba(237,28,36,.14); border:1px solid rgba(237,28,36,.38);
+      font-size:.8rem; margin-right:10px !important;
+    }
+    /* Botão Limpar filtros: contorno vermelho, largura total */
+    div.st-key-btn_limpar_filtros button {
+      width:100% !important; background:transparent !important; color:#ff343c !important;
+      border:1px solid #ed1c24 !important; border-radius:9px !important; min-height:42px !important; font-weight:650 !important;
+    }
+    div.st-key-btn_limpar_filtros button:hover { background:rgba(237,28,36,.12) !important; border-color:#ff343c !important; }
+    /* Filtros da lateral: campo fechado, uma linha, placeholder Todas/Todos */
+    [data-testid="stSidebar"] [data-baseweb="select"] > div:first-child { flex-wrap:nowrap !important; overflow:hidden !important; max-height:38px !important; }
+    [data-testid="stSidebar"] [data-baseweb="select"] input::placeholder { color:#e4e6e8 !important; opacity:1 !important; }
+
+    /* Ícones das abas (SVG embutido) */
+    div.st-key-aba_ativa [role="radiogroup"] label p { display:flex !important; align-items:center !important; justify-content:center !important; gap:0; }
+    div.st-key-aba_ativa [role="radiogroup"] label p::before {
+      content:""; display:inline-block; width:24px; height:24px; margin-right:12px; flex:0 0 24px;
+      background-repeat:no-repeat; background-position:center; background-size:contain;
+    }
+    div.st-key-aba_ativa [role="radiogroup"] > label:nth-child(1) p::before { background-image:url(\"data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220%200%2024%2024%22%20fill=%22none%22%20stroke=%22white%22%20stroke-width=%221.7%22%20stroke-linecap=%22round%22%20stroke-linejoin=%22round%22%3E%3Ccircle%20cx=%228%22%20cy=%227%22%20r=%223%22/%3E%3Cpath%20d=%22M2.5%2019c0-3.3%202.5-5.5%205.5-5.5s5.5%202.2%205.5%205.5%22/%3E%3Cpath%20d=%22M15%2017v-3M18%2017v-6M21%2017v-9%22/%3E%3C/svg%3E\") !important; }
+    div.st-key-aba_ativa [role="radiogroup"] > label:nth-child(2) p::before { background-image:url(\"data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220%200%2024%2024%22%20fill=%22none%22%20stroke=%22white%22%20stroke-width=%221.7%22%20stroke-linecap=%22round%22%20stroke-linejoin=%22round%22%3E%3Ccircle%20cx=%2212%22%20cy=%228%22%20r=%223.5%22/%3E%3Cpath%20d=%22M5%2020c0-3.9%203.1-7%207-7s7%203.1%207%207%22/%3E%3C/svg%3E\") !important; }
+    div.st-key-aba_ativa [role="radiogroup"] > label:nth-child(3) p::before { background-image:url(\"data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220%200%2024%2024%22%20fill=%22none%22%20stroke=%22white%22%20stroke-width=%221.7%22%20stroke-linecap=%22round%22%20stroke-linejoin=%22round%22%3E%3Crect%20x=%223%22%20y=%2212%22%20width=%227%22%20height=%227%22/%3E%3Crect%20x=%2214%22%20y=%2212%22%20width=%227%22%20height=%227%22/%3E%3Crect%20x=%228.5%22%20y=%224%22%20width=%227%22%20height=%227%22/%3E%3C/svg%3E\") !important; }
+    div.st-key-aba_ativa [role="radiogroup"] > label:nth-child(4) p::before { background-image:url(\"data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220%200%2024%2024%22%20fill=%22none%22%20stroke=%22white%22%20stroke-width=%221.7%22%20stroke-linecap=%22round%22%20stroke-linejoin=%22round%22%3E%3Cpath%20d=%22M3%2012V4h8l9%209-8%208z%22/%3E%3Ccircle%20cx=%227.5%22%20cy=%228.5%22%20r=%221.3%22/%3E%3C/svg%3E\") !important; }
+    div.st-key-aba_ativa [role="radiogroup"] > label:nth-child(5) p::before { background-image:url(\"data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220%200%2024%2024%22%20fill=%22none%22%20stroke=%22white%22%20stroke-width=%221.7%22%20stroke-linecap=%22round%22%20stroke-linejoin=%22round%22%3E%3Cpath%20d=%22M3%2017l5-5%204%204%208-9%22/%3E%3Cpath%20d=%22M15%207h5v5%22/%3E%3C/svg%3E\") !important; }
+    div.st-key-aba_ativa [role="radiogroup"] > label:nth-child(6) p::before { background-image:url(\"data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220%200%2024%2024%22%20fill=%22none%22%20stroke=%22white%22%20stroke-width=%221.7%22%20stroke-linecap=%22round%22%20stroke-linejoin=%22round%22%3E%3Cpath%20d=%22M12%203%204%207v10l8%204%208-4V7z%22/%3E%3Cpath%20d=%22M4%207l8%204%208-4M12%2011v10%22/%3E%3C/svg%3E\") !important; }
+    div.st-key-aba_ativa [role="radiogroup"] label { min-height:58px !important; }
+    div.st-key-aba_ativa [role="radiogroup"] label p { font-size:.9rem !important; font-weight:600 !important; }
+
+    /* Títulos da barra lateral com ícone vermelho */
+    .sb-title { display:flex; align-items:center; gap:12px; margin:.35rem 0 .6rem; font-size:.98rem; font-weight:650; color:#f4f6f8; letter-spacing:-.01em; }
+    .sb-title svg { width:22px; height:22px; flex:0 0 22px; fill:none; stroke:#ed1c24; stroke-width:1.7; stroke-linecap:round; stroke-linejoin:round; }
+    [data-testid="stSidebar"] hr { margin:.9rem 0 !important; }
+
+    /* Upload: área tracejada com ícone de nuvem */
+    [data-testid="stFileUploaderDropzone"] {
+      flex-direction:column !important; align-items:center !important; justify-content:center !important; gap:8px !important;
+      padding:20px 10px 16px !important; border:1.5px dashed rgba(160,170,180,.38) !important; border-radius:12px !important;
+      background:rgba(255,255,255,.015) !important; text-align:center;
+    }
+    [data-testid="stFileUploaderDropzone"]::before {
+      content:""; width:34px; height:34px; background:url(\"data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220%200%2024%2024%22%20fill=%22none%22%20stroke=%22%23e4e6e8%22%20stroke-width=%221.5%22%20stroke-linecap=%22round%22%20stroke-linejoin=%22round%22%3E%3Cpath%20d=%22M7%2018a4.5%204.5%200%200%201-.7-8.9A6%206%200%200%201%2017.7%208.6%204%204%200%200%201%2017%2018%22/%3E%3Cpath%20d=%22M12%2021v-8M9%2015.5l3-3%203%203%22/%3E%3C/svg%3E\") center/contain no-repeat;
+    }
+    [data-testid="stFileUploaderDropzoneInstructions"] > * { display:none !important; }
+    [data-testid="stFileUploaderDropzoneInstructions"]::after {
+      content:"Selecione a base Excel ou CSV\\A .xlsx, .xlsm, .xls ou .csv"; white-space:pre-line; display:block;
+      font-size:.8rem; line-height:1.7; color:#c5cbd1; text-align:center;
+    }
+    [data-testid="stFileUploaderDropzone"] button {
+      min-height:30px !important; padding:.1rem .8rem !important; font-size:.75rem !important; border-radius:8px !important;
+      background:transparent !important; border:1px solid rgba(237,28,36,.7) !important; color:#ff5058 !important;
+    }
+
+    /* Tabela de share dos clientes (bolinha na cor da fatia) */
+    .share-tbl { width:100%; border-collapse:separate; border-spacing:0; table-layout:fixed; font-size:.8rem; }
+    .share-tbl th { text-align:right; font-weight:500; color:#c5cbd1; padding:7px 8px; background:rgba(255,255,255,.045); }
+    .share-tbl th:first-child { text-align:left; border-radius:8px 0 0 8px; background:transparent; }
+    .share-tbl th:last-child { border-radius:0 8px 8px 0; }
+    .share-tbl td { text-align:right; padding:9px 8px; color:#f1f3f4; white-space:nowrap; }
+    .share-tbl td:first-child { text-align:left; overflow:hidden; text-overflow:ellipsis; }
+    .share-tbl th:nth-child(1), .share-tbl td:nth-child(1) { width:46%; }
+    .share-tbl th:nth-child(2), .share-tbl td:nth-child(2) { width:34%; }
+    .share-tbl .dot { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:10px; vertical-align:middle; }
+
+    /* Dia / Mês / Trimestre: botão segmentado à direita, sem bolinha */
+    div.st-key-dashboard_tempo { display:flex; justify-content:flex-end; margin:0 !important; position:static; }
+    div.st-key-dashboard_tempo [data-testid="stRadio"] { width:auto !important; }
+    div.st-key-dashboard_tempo [role="radiogroup"] {
+      display:inline-flex !important; gap:0 !important; padding:0 !important; overflow:hidden;
+      border:1px solid #2a3036 !important; border-radius:8px !important; background:#0a0d0f !important;
+    }
+    div.st-key-dashboard_tempo [role="radiogroup"] label {
+      margin:0 !important; padding:5px 15px !important; min-height:0 !important; border-radius:0 !important;
+      background:transparent !important; justify-content:center !important;
+    }
+    div.st-key-dashboard_tempo [role="radiogroup"] label p { font-size:.8rem !important; color:#e4e6e8 !important; margin:0 !important; }
+    div.st-key-dashboard_tempo [role="radiogroup"] label > *:not(input):not([data-testid="stMarkdownContainer"]):not(:has([data-testid="stMarkdownContainer"])) { display:none !important; }
+    div.st-key-dashboard_tempo [role="radiogroup"] label:has(input:checked) { background:linear-gradient(135deg,#f21b23,#be0c15) !important; }
+    div.st-key-dashboard_tempo [role="radiogroup"] label:has(input:checked) p { color:#fff !important; font-weight:650 !important; }
+
+    /* Esconde a bolinha de rádio em qualquer versão do Streamlit (abas e Dia/Mês/Trimestre) */
+    div.st-key-aba_ativa [role="radiogroup"] label > div:first-child:not(:has([data-testid="stMarkdownContainer"])),
+    div.st-key-dashboard_tempo [role="radiogroup"] label > div:first-child:not(:has([data-testid="stMarkdownContainer"])),
+    div.st-key-aba_ativa [role="radiogroup"] label [data-baseweb="radio"] > div:first-child:not(:has([data-testid="stMarkdownContainer"])),
+    div.st-key-dashboard_tempo [role="radiogroup"] label [data-baseweb="radio"] > div:first-child:not(:has([data-testid="stMarkdownContainer"])),
+    div.st-key-aba_ativa [role="radiogroup"] label > span:empty,
+    div.st-key-dashboard_tempo [role="radiogroup"] label > span:empty { display:none !important; }
+    div.st-key-dashboard_tempo [role="radiogroup"] label::before,
+    div.st-key-dashboard_tempo [role="radiogroup"] label::after { display:none !important; }
+
+    /* Reserva espaço no fim da página: o botão flutuante "Assistente de IA" e o rodapé fixo não cobrem os cartões */
+    [data-testid="stMainBlockContainer"], .block-container { padding-bottom: 110px !important; }
+    .dash-section-title { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }
+    </style>
+    """,
     unsafe_allow_html=True,
 )
 
 with st.sidebar:
-    st.header("♙  1. Carregar dados")
-    arquivo = st.file_uploader("Selecione a base Excel ou CSV", type=["xlsx", "xlsm", "xls", "csv"])
+    st.markdown('<div class="sb-title"><svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="3.5"/><path d="M5 20c0-3.9 3.1-7 7-7s7 3.1 7 7"/></svg><span>1. Carregar dados</span></div>', unsafe_allow_html=True)
+    arquivo = st.file_uploader("Selecione a base Excel ou CSV", type=["xlsx", "xlsm", "xls", "csv"], label_visibility="collapsed")
     st.divider()
-    st.header("⚙  2. Configurações")
+    st.markdown('<div class="sb-title"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/></svg><span>2. Configurações</span></div>', unsafe_allow_html=True)
 
 if arquivo is None:
     st.info("Para começar, carregue a planilha que contém os cabeçalhos de vendas informados na conversa.")
@@ -902,6 +1159,15 @@ if not col_produto:
     st.warning("Não encontrei Produto nem SKU.")
 
 # Fonte de data escolhida pelo usuário; no modo faturamento, Data Pedido é usada como fallback.
+# Se a base não tem nenhuma Data Faturamento válida (coluna ausente ou toda vazia),
+# a Data Pedido é selecionada automaticamente e a escolha fica travada.
+sem_data_faturamento = not df["_data_faturamento"].notna().any()
+if sem_data_faturamento and df["_data_pedido"].notna().any():
+    st.session_state["fonte_data_referencia"] = "Data Pedido"
+    data_padrao = "Data Pedido (a base não possui Data Faturamento)"
+else:
+    sem_data_faturamento = False
+
 with st.sidebar:
     st.caption("Data utilizada nos filtros e análises")
     fonte_data = st.radio(
@@ -910,7 +1176,10 @@ with st.sidebar:
         index=0,
         key="fonte_data_referencia",
         label_visibility="collapsed",
+        disabled=sem_data_faturamento,
     )
+    if sem_data_faturamento:
+        st.caption("Sem Data Faturamento na base: usando Data Pedido automaticamente.")
 
 if fonte_data == "Data Pedido":
     df["_data"] = df["_data_pedido"].fillna(df["_data_faturamento"])
@@ -918,8 +1187,11 @@ else:
     df["_data"] = df["_data_faturamento"].fillna(df["_data_pedido"])
 
 # Filtros globais
+# Os filtros (exceto o período) são guardados para reaplicar no período anterior dos KPIs.
+filtros_aplicados = []
+periodo_atual = None
 with st.sidebar:
-    st.subheader("▦  Filtros globais")
+    st.markdown('<div class="sb-title"><svg viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="15" rx="2"/><path d="M3.5 10h17M8 3v4M16 3v4"/></svg><span>Filtros globais</span></div>', unsafe_allow_html=True)
     data_min = df["_data"].min()
     data_max = df["_data"].max()
     if pd.notna(data_min) and pd.notna(data_max):
@@ -928,10 +1200,12 @@ with st.sidebar:
             value=(data_min.date(), data_max.date()),
             min_value=data_min.date(),
             max_value=data_max.date(),
+            format="DD/MM/YYYY",
         )
         if isinstance(intervalo, (tuple, list)) and len(intervalo) == 2:
             inicio, fim = pd.Timestamp(intervalo[0]), pd.Timestamp(intervalo[1]) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
             filtrado = df[df["_data"].between(inicio, fim, inclusive="both")].copy()
+            periodo_atual = (inicio, fim)
         else:
             filtrado = df.copy()
         st.caption("Para o comparativo com o ano anterior, mantenha no período pelo menos o último trimestre e o mesmo trimestre do ano anterior.")
@@ -948,36 +1222,54 @@ with st.sidebar:
         if tem_empresa_vazia:
             opcoes_empresa.append(rotulo_empresa_vazia)
         selecionadas_empresa = st.multiselect(
-            "Empresa", opcoes_empresa, default=opcoes_empresa
+            "Empresa", opcoes_empresa, default=[], placeholder="Todas"
         )
-        mascara_empresa = empresa_filtro.isin(selecionadas_empresa)
-        if rotulo_empresa_vazia in selecionadas_empresa:
-            mascara_empresa |= empresa_filtro.eq("")
-        filtrado = filtrado[mascara_empresa]
+        if selecionadas_empresa:  # sem seleção = todas (não filtra nada)
+            mascara_empresa = empresa_filtro.isin(selecionadas_empresa)
+            if rotulo_empresa_vazia in selecionadas_empresa:
+                mascara_empresa |= empresa_filtro.eq("")
+            filtrado = filtrado[mascara_empresa]
+
+            def _filtro_empresa(b, c=col["empresa"], sel=list(selecionadas_empresa), vazio=rotulo_empresa_vazia):
+                serie = b[c].fillna("").astype(str).str.strip()
+                m = serie.isin(sel)
+                if vazio in sel:
+                    m = m | serie.eq("")
+                return b[m]
+
+            filtros_aplicados.append(_filtro_empresa)
     if col["status_faturamento"]:
         opcoes_status = sorted(filtrado[col["status_faturamento"]].dropna().astype(str).unique())
         if opcoes_status:
-            status_escolhidos = st.multiselect("Status de faturamento", opcoes_status, default=opcoes_status)
-            filtrado = filtrado[filtrado[col["status_faturamento"]].astype(str).isin(status_escolhidos)]
+            status_escolhidos = st.multiselect("Status de faturamento", opcoes_status, default=[], placeholder="Todos")
+            if status_escolhidos:  # sem seleção = todos (não filtra nada)
+                filtrado = filtrado[filtrado[col["status_faturamento"]].astype(str).isin(status_escolhidos)]
+                filtros_aplicados.append(lambda b, c=col["status_faturamento"], sel=list(status_escolhidos): b[b[c].astype(str).isin(sel)])
     if col["departamento"]:
         opcoes_departamento = sorted(filtrado[col["departamento"]].dropna().astype(str).unique())
         if opcoes_departamento:
-            departamentos_escolhidos = st.multiselect("Departamento", opcoes_departamento, default=opcoes_departamento)
-            filtrado = filtrado[filtrado[col["departamento"]].astype(str).isin(departamentos_escolhidos)]
+            departamentos_escolhidos = st.multiselect("Departamento", opcoes_departamento, default=[], placeholder="Todos")
+            if departamentos_escolhidos:  # sem seleção = todos (não filtra nada)
+                filtrado = filtrado[filtrado[col["departamento"]].astype(str).isin(departamentos_escolhidos)]
+                filtros_aplicados.append(lambda b, c=col["departamento"], sel=list(departamentos_escolhidos): b[b[c].astype(str).isin(sel)])
     if col["gerente_regiao"]:
         opcoes_gerente = sorted(filtrado[col["gerente_regiao"]].dropna().astype(str).unique())
         if opcoes_gerente:
-            gerentes_escolhidos = st.multiselect("Gerente região", opcoes_gerente, default=opcoes_gerente)
-            filtrado = filtrado[filtrado[col["gerente_regiao"]].astype(str).isin(gerentes_escolhidos)]
+            gerentes_escolhidos = st.multiselect("Gerente região", opcoes_gerente, default=[], placeholder="Todos")
+            if gerentes_escolhidos:  # sem seleção = todos (não filtra nada)
+                filtrado = filtrado[filtrado[col["gerente_regiao"]].astype(str).isin(gerentes_escolhidos)]
+                filtros_aplicados.append(lambda b, c=col["gerente_regiao"], sel=list(gerentes_escolhidos): b[b[c].astype(str).isin(sel)])
     if col["tipo_operacao"]:
         opcoes_operacao = sorted(filtrado[col["tipo_operacao"]].dropna().astype(str).unique())
         if opcoes_operacao:
             operacoes_escolhidas = st.multiselect(
-                "Tipo de Operação", opcoes_operacao, default=opcoes_operacao
+                "Tipo de Operação", opcoes_operacao, default=[], placeholder="Todos"
             )
-            filtrado = filtrado[
-                filtrado[col["tipo_operacao"]].astype(str).isin(operacoes_escolhidas)
-            ]
+            if operacoes_escolhidas:  # sem seleção = todos (não filtra nada)
+                filtrado = filtrado[
+                    filtrado[col["tipo_operacao"]].astype(str).isin(operacoes_escolhidas)
+                ]
+                filtros_aplicados.append(lambda b, c=col["tipo_operacao"], sel=list(operacoes_escolhidas): b[b[c].astype(str).isin(sel)])
 
 
 def renderizar_assistente_ia():
@@ -1010,12 +1302,12 @@ if "_aba_pendente" in st.session_state:
     st.session_state["aba_ativa"] = st.session_state.pop("_aba_pendente")
 
 _rotulos_abas = {
-    ABA_VENDEDOR: "♧  Vendas por vendedor",
-    ABA_CLIENTE: "♙  Vendas por cliente",
-    ABA_ITENS: "♧  Itens por segmento",
-    ABA_PRECO: "▥  Preço médio mensal",
-    ABA_PROJECOES: "◌  Projeções mensais",
-    ABA_DADOS: "▣  Conferência dos dados",
+    ABA_VENDEDOR: "Vendas por vendedor",
+    ABA_CLIENTE: "Vendas por cliente",
+    ABA_ITENS: "Itens por segmento",
+    ABA_PRECO: "Preço médio mensal",
+    ABA_PROJECOES: "Projeções mensais",
+    ABA_DADOS: "Conferência dos dados",
 }
 aba_ativa = st.radio(
     "Seção",
@@ -1039,13 +1331,130 @@ total_qtde = filtrado["_quantidade"].sum()
 clientes_count = filtrado["_cliente"].nunique()
 produtos_count = filtrado["_produto"].nunique()
 
-k1, k2, k3, k4 = st.columns(4)
-k1.metric("Faturamento analisado", moeda(total_vendas))
-k2.metric("Quantidade vendida", f"{total_qtde:,.0f}".replace(",", "."))
-k3.metric("Clientes gerenciais", f"{clientes_count:,}".replace(",", "."))
-k4.metric("Produtos vendidos", f"{produtos_count:,}".replace(",", "."))
 
-if st.sidebar.button("🧹 Limpar filtros das abas"):
+# ---------- KPIs com variação vs. período anterior ----------
+# 1) Período anterior = intervalo de mesmo tamanho imediatamente antes do filtrado, com os mesmos filtros.
+# 2) Se a base não tem dados nesse intervalo (ex.: o período filtrado já cobre a base inteira), compara
+#    a 2ª metade do período com a 1ª metade, e o cartão passa a dizer isso.
+def _metricas(base):
+    return {
+        "valor": base["_valor"].sum(),
+        "qtde": base["_quantidade"].sum(),
+        "clientes": base["_cliente"].nunique(),
+        "produtos": base["_produto"].nunique(),
+    }
+
+
+def comparativo_kpis():
+    if periodo_atual is None:
+        return None
+    ini, fim = periodo_atual
+    um_seg = pd.Timedelta(seconds=1)
+    duracao = fim - ini + um_seg
+    ant_fim = ini - um_seg
+    ant_ini = ant_fim - duracao + um_seg
+    base_ant = df[df["_data"].between(ant_ini, ant_fim, inclusive="both")]
+    for aplicar in filtros_aplicados:
+        base_ant = aplicar(base_ant)
+    if not base_ant.empty:
+        return {
+            "legenda": "vs. período anterior",
+            "rotulo": f"{ant_ini:%d/%m/%Y} a {ant_fim:%d/%m/%Y}",
+            "atual": _metricas(filtrado),
+            "anterior": _metricas(base_ant),
+        }
+    # Alternativa: metades do próprio período filtrado.
+    base_dt = filtrado[filtrado["_data"].notna()]
+    if base_dt.empty or duracao < pd.Timedelta(days=2):
+        return None
+    meio = ini + duracao / 2
+    h1, h2 = base_dt[base_dt["_data"] < meio], base_dt[base_dt["_data"] >= meio]
+    if h1.empty or h2.empty:
+        return None
+    return {
+        "legenda": "2ª metade vs. 1ª metade",
+        "rotulo": f"{ini:%d/%m/%Y} a {(meio - um_seg):%d/%m/%Y} (1ª) x {meio:%d/%m/%Y} a {fim:%d/%m/%Y} (2ª). Não há dados antes do período filtrado",
+        "atual": _metricas(h2),
+        "anterior": _metricas(h1),
+    }
+
+
+def variacao_html(atual, anterior, rotulo=None, legenda="vs. período anterior"):
+    dica = f' title="Período comparado: {rotulo}"' if rotulo else ""
+    if anterior is None or not anterior:
+        return '<div class="kpi-delta kpi-delta-nd" title="Sem dados no período anterior para comparar"><span>—</span><small>vs. período anterior</small></div>'
+    var = (atual - anterior) / abs(anterior) * 100
+    if var > 0:
+        cls, seta = "kpi-up", "▲"
+    elif var < 0:
+        cls, seta = "kpi-down", "▼"
+    else:
+        cls, seta = "kpi-flat", "▬"
+    txt = f"{var:+.1f}%".replace(".", ",")
+    return f'<div class="kpi-delta"{dica}><span class="{cls}">{seta} {txt}</span><small>{legenda}</small></div>'
+
+
+_ICONES_KPI = {
+    "moeda": '<svg viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="7" ry="3"/><path d="M5 6v6c0 1.7 3.1 3 7 3s7-1.3 7-3V6"/><path d="M5 12v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6"/></svg>',
+    "caixa": '<svg viewBox="0 0 24 24"><path d="M12 3 3.5 7.5v9L12 21l8.5-4.5v-9z"/><path d="M3.5 7.5 12 12l8.5-4.5M12 12v9"/><path d="m7.8 5.3 8.5 4.6"/></svg>',
+    "clientes": '<svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.2"/><path d="M3 20c0-3.3 2.7-6 6-6s6 2.7 6 6"/><circle cx="17" cy="9" r="2.5"/><path d="M16 14.2c2.9.3 5 2.6 5 5.8"/></svg>',
+    "cubo": '<svg viewBox="0 0 24 24"><path d="M12 3 4 7.5v9L12 21l8-4.5v-9z"/><path d="M4 7.5 12 12l8-4.5M12 12v9"/></svg>',
+}
+
+
+def cartao_kpi(icone, rotulo, valor, atual, anterior, periodo=None, legenda="vs. período anterior"):
+    return (
+        '<div class="kpi-card">'
+        f'<div class="kpi-icon">{_ICONES_KPI[icone]}</div>'
+        '<div class="kpi-body">'
+        f'<div class="kpi-label">{rotulo}</div>'
+        f'<div class="kpi-value">{valor}</div>'
+        f'{variacao_html(atual, anterior, periodo, legenda)}'
+        '</div></div>'
+    )
+
+
+_comp = comparativo_kpis() or {}
+_ant = _comp.get("anterior", {})
+_atu = _comp.get("atual", {})
+_per = _comp.get("rotulo")
+_leg = _comp.get("legenda", "vs. período anterior")
+st.markdown(
+    """
+    <style>
+    .kpi-grid { display:grid; grid-template-columns:repeat(4, minmax(0,1fr)); gap:14px; margin:6px 0 16px; }
+    .kpi-card {
+      position:relative; overflow:hidden; display:flex; align-items:flex-start; gap:16px;
+      padding:20px 22px; border-radius:14px; border:1px solid rgba(160,170,180,.18);
+      background:linear-gradient(135deg, #0d1114 0%, #090b0d 62%, rgba(237,28,36,.16) 140%);
+    }
+    .kpi-icon { flex:0 0 auto; width:46px; height:46px; display:flex; align-items:center; justify-content:center; }
+    .kpi-icon svg { width:42px; height:42px; fill:none; stroke:#ed1c24; stroke-width:1.6; stroke-linecap:round; stroke-linejoin:round; }
+    .kpi-body { min-width:0; }
+    .kpi-label { color:#e1e3e5; font-size:.92rem; font-weight:500; }
+    .kpi-value { color:#fff; font-size:clamp(1.35rem,2vw,2.05rem); font-weight:750; letter-spacing:-.04em; line-height:1.2; margin:6px 0 10px; white-space:nowrap; }
+    .kpi-delta { display:flex; align-items:center; gap:12px; flex-wrap:wrap; font-size:.8rem; }
+    .kpi-delta small { color:#9ea5ac; font-size:.74rem; }
+    .kpi-up { color:#ff343c; font-weight:700; }
+    .kpi-down { color:#aab2ba; font-weight:700; }
+    .kpi-flat, .kpi-delta-nd span { color:#aab2ba; font-weight:700; }
+    @media (max-width:1100px) { .kpi-grid { grid-template-columns:repeat(2, minmax(0,1fr)); } }
+    @media (max-width:560px) { .kpi-grid { grid-template-columns:1fr; } .kpi-card { padding:14px; } }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+st.markdown(
+    '<div class="kpi-grid">'
+    + cartao_kpi("moeda", "Faturamento analisado", moeda(total_vendas), _atu.get("valor", total_vendas), _ant.get("valor"), _per, _leg)
+    + cartao_kpi("caixa", "Quantidade vendida", f"{total_qtde:,.0f}".replace(",", "."), _atu.get("qtde", total_qtde), _ant.get("qtde"), _per, _leg)
+    + cartao_kpi("clientes", "Clientes gerenciais", f"{clientes_count:,}".replace(",", "."), _atu.get("clientes", clientes_count), _ant.get("clientes"), _per, _leg)
+    + cartao_kpi("cubo", "Produtos vendidos", f"{produtos_count:,}".replace(",", "."), _atu.get("produtos", produtos_count), _ant.get("produtos"), _per, _leg)
+    + "</div>",
+    unsafe_allow_html=True,
+)
+
+if st.sidebar.button("Limpar filtros", key="btn_limpar_filtros", use_container_width=True):
     for _chave in CHAVES_PERSISTENTES:
         st.session_state.pop(_chave, None)
     st.rerun()
@@ -1237,10 +1646,9 @@ if aba_ativa == ABA_PROJECOES:
         eixo_meses = hist_fechado["Mês"].tolist() + previsoes_proj["Mês"].tolist()
         if not hist_parcial.empty:
             eixo_meses.insert(len(hist_fechado), hist_parcial.iloc[0]["Mês"])
+        padronizar_grafico(fig_proj, altura=430, margem=dict(l=12, r=12, t=40, b=35), legenda=True)
         fig_proj.update_layout(
-            template="plotly_dark", height=430, margin=dict(l=12, r=12, t=30, b=35),
-            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            font=dict(family="Inter, sans-serif", color="#e8eaed", size=11), hovermode="x unified",
+            hovermode="x unified",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
             xaxis_title="Mês", yaxis_title=rotulo_metrica_proj,
         )
@@ -1341,19 +1749,7 @@ if aba_ativa == ABA_VENDEDOR:
     TEXT = "#e8eaed"
 
     def estilo_dashboard(fig, altura=215):
-        fig.update_layout(
-            template="plotly_dark",
-            height=altura,
-            margin=dict(l=4, r=8, t=34, b=20),
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            font=dict(family="Inter, sans-serif", color=TEXT, size=10),
-            showlegend=False,
-            hoverlabel=dict(bgcolor="#101316", font_color="#f6f6f6", bordercolor="#393f45"),
-        )
-        fig.update_xaxes(showgrid=True, gridcolor="rgba(140,150,160,.12)", zerolinecolor="rgba(140,150,160,.18)", title_font_size=10, tickfont_size=9)
-        fig.update_yaxes(showgrid=False, zeroline=False, title_font_size=10, tickfont_size=9)
-        return fig
+        return padronizar_grafico(fig, altura=altura, margem=dict(l=4, r=8, t=34, b=20))
 
     # Linha superior: dois gráficos de vendedor e share dos clientes.
     sup_esq, sup_dir = st.columns([1.04, 1.0], gap="small")
@@ -1369,16 +1765,18 @@ if aba_ativa == ABA_VENDEDOR:
                 with cv1:
                     st.markdown('<div class="dash-chart-caption">Faturamento por vendedor</div>', unsafe_allow_html=True)
                     fig_vdash = px.bar(resumo_v_dash, x="_valor", y="_vendedor", orientation="h", text="_valor", color_discrete_sequence=[RED])
-                    fig_vdash.update_traces(texttemplate="R$ %{x:,.0f}", textposition="outside", cliponaxis=False, marker_line_width=0)
+                    fig_vdash.update_traces(text=[f"R$ {num_br(v)}" for v in resumo_v_dash["_valor"]], texttemplate="%{text}", textposition="outside", cliponaxis=False, marker_line_width=0)
                     fig_vdash.update_layout(xaxis_title="Valor (R$)", yaxis_title="", margin=dict(l=2,r=34,t=8,b=12))
-                    fig_vdash.update_xaxes(tickprefix="R$ ", tickformat="~s")
+                    _tv, _tt = ticks_moeda_br(max(resumo_v_dash["_valor"].max(), 1) * 1.45, alvo=4, rotulador=rotulo_eixo_curto)
+                    fig_vdash.update_xaxes(tickmode="array", tickvals=_tv, ticktext=_tt, range=[0, _tv[-1]])
                     st.plotly_chart(estilo_dashboard(fig_vdash, 202), use_container_width=True, config={"displayModeBar": False}, key="dashboard_vendedor_valor")
                 with cv2:
                     st.markdown('<div class="dash-chart-caption">Quantidade por vendedor</div>', unsafe_allow_html=True)
                     fig_qdash = px.bar(resumo_q_dash, x="_quantidade", y="_vendedor", orientation="h", text="_quantidade", color_discrete_sequence=[GREY])
-                    fig_qdash.update_traces(texttemplate="%{x:,.0f}", textposition="outside", cliponaxis=False, marker_line_width=0)
+                    fig_qdash.update_traces(text=[num_br(v) for v in resumo_q_dash["_quantidade"]], texttemplate="%{text}", textposition="outside", cliponaxis=False, marker_line_width=0)
                     fig_qdash.update_layout(xaxis_title="Quantidade", yaxis_title="", margin=dict(l=2,r=32,t=8,b=12))
-                    fig_qdash.update_xaxes(tickformat="~s")
+                    _tv, _tt = ticks_moeda_br(max(resumo_q_dash["_quantidade"].max(), 1) * 1.35, alvo=4, rotulador=rotulo_eixo_curto)
+                    fig_qdash.update_xaxes(tickmode="array", tickvals=_tv, ticktext=_tt, range=[0, _tv[-1]])
                     st.plotly_chart(estilo_dashboard(fig_qdash, 202), use_container_width=True, config={"displayModeBar": False}, key="dashboard_vendedor_qtde")
             else:
                 st.info("Adicione uma coluna de vendedor para visualizar este gráfico.")
@@ -1394,24 +1792,26 @@ if aba_ativa == ABA_VENDEDOR:
                 if resto_dash > 0:
                     top_dash = pd.concat([top_dash, pd.DataFrame([{"_cliente": "Outros clientes", "_valor": resto_dash}])], ignore_index=True)
                 top_dash["Share (%)"] = (top_dash["_valor"] / grand_total_dash * 100).fillna(0).round(1) if grand_total_dash else 0
+                CORES_SHARE = ["#ed1c24", "#7d0f17", "#e8505a", "#9aa0a8", "#5f6670", "#3a4149"]
                 cs1, cs2 = st.columns([.92, 1.18], gap="small")
                 with cs1:
                     fig_share = px.pie(top_dash, names="_cliente", values="_valor", hole=.60,
-                                       color_discrete_sequence=[RED, "#b70e18", "#e64a53", "#686f7a", "#9298a1", "#3a4149"])
+                                       color_discrete_sequence=CORES_SHARE)
                     fig_share.update_traces(textinfo="none", marker=dict(line=dict(color="#090b0d", width=1)),
                                             hovertemplate="%{label}<br>R$ %{value:,.2f}<br>%{percent}<extra></extra>")
                     fig_share.update_layout(showlegend=False, margin=dict(l=0,r=0,t=2,b=2),
                                             annotations=[dict(text=f"Total<br>R$ {grand_total_dash/1_000_000:.2f} M".replace(".", ","), x=.5, y=.5, font=dict(color="white",size=12), showarrow=False)])
                     st.plotly_chart(estilo_dashboard(fig_share, 218), use_container_width=True, config={"displayModeBar": False}, key="dashboard_share_donut")
                 with cs2:
-                    tabela_share = top_dash.rename(columns={"_cliente":"Cliente gerencial", "_valor":"Faturamento (R$)"})
-                    st.dataframe(
-                        tabela_share[["Cliente gerencial", "Faturamento (R$)", "Share (%)"]],
-                        use_container_width=True, hide_index=True, height=216,
-                        column_config={
-                            "Faturamento (R$)": st.column_config.NumberColumn("Faturamento (R$)", format="R$ %.2f"),
-                            "Share (%)": st.column_config.NumberColumn("Share", format="%.1f%%"),
-                        },
+                    _linhas = "".join(
+                        f'<tr><td><span class="dot" style="background:{CORES_SHARE[k % len(CORES_SHARE)]}"></span>{html.escape(str(nome))}</td>'
+                        f'<td>{num_br(valor)}</td><td>{pct_br(share)}</td></tr>'
+                        for k, (nome, valor, share) in enumerate(zip(top_dash["_cliente"], top_dash["_valor"], top_dash["Share (%)"]))
+                    )
+                    st.markdown(
+                        '<table class="share-tbl"><thead><tr><th>Cliente gerencial</th><th>Faturamento (R$)</th><th>Share</th></tr></thead>'
+                        f'<tbody>{_linhas}</tbody></table>',
+                        unsafe_allow_html=True,
                     )
             else:
                 st.info("Adicione a coluna Cliente ou Cliente Gerencial para visualizar a participação.")
@@ -1420,8 +1820,11 @@ if aba_ativa == ABA_VENDEDOR:
     inf_esq, inf_meio = st.columns([1.95, 1.05], gap="small")
     with inf_esq:
         with st.container(border=True):
-            st.markdown('<div class="dash-section-title"><span class="dash-red">▥</span>Evolução temporal do faturamento</div>', unsafe_allow_html=True)
-            granularidade_dash = st.radio("Período", ["Dia", "Mês", "Trimestre"], horizontal=True, key="dashboard_tempo", label_visibility="collapsed")
+            _tit_col, _seg_col = st.columns([1, 1], gap="small", vertical_alignment="center")
+            with _tit_col:
+                st.markdown('<div class="dash-section-title"><span class="dash-red">▥</span>Evolução temporal do faturamento</div>', unsafe_allow_html=True)
+            with _seg_col:
+                granularidade_dash = st.radio("Período", ["Dia", "Mês", "Trimestre"], horizontal=True, key="dashboard_tempo", label_visibility="collapsed")
             serie_dash = base_dash[base_dash["_data"].notna()].copy()
             if granularidade_dash == "Dia":
                 serie_dash["_periodo"] = serie_dash["_data"].dt.strftime("%d/%m/%y")
@@ -1438,7 +1841,13 @@ if aba_ativa == ABA_VENDEDOR:
                 fig_evolucao = px.line(evolucao_dash, x="_periodo", y="_valor", markers=True)
                 fig_evolucao.update_traces(line=dict(color=RED, width=2.5), marker=dict(size=5, color=RED, line=dict(color="#ff8a8f",width=1)), fill="tozeroy", fillcolor="rgba(237,28,36,.16)")
                 fig_evolucao.update_layout(xaxis_title="", yaxis_title="", margin=dict(l=6,r=6,t=6,b=22), hovermode="x unified")
-                fig_evolucao.update_yaxes(tickprefix="R$ ", tickformat="~s")
+                fig_evolucao.update_traces(
+                    customdata=[f"R$ {num_br(v)}" for v in evolucao_dash["_valor"]],
+                    hovertemplate="%{x}<br><b>%{customdata}</b><extra></extra>",
+                )
+                _tv, _tt = ticks_moeda_br(evolucao_dash["_valor"].max())
+                if _tv:
+                    fig_evolucao.update_yaxes(tickmode="array", tickvals=_tv, ticktext=_tt, range=[0, _tv[-1]])
                 fig_evolucao.update_xaxes(tickangle=0, nticks=12)
                 st.plotly_chart(estilo_dashboard(fig_evolucao, 224), use_container_width=True, config={"displayModeBar": False}, key="dashboard_evolucao_faturamento")
             else:
@@ -1452,10 +1861,12 @@ if aba_ativa == ABA_VENDEDOR:
                 seg_dash = base_dash.groupby("_segmento", as_index=False)["_valor"].sum().sort_values("_valor", ascending=False).head(6).sort_values("_valor")
                 if not seg_dash.empty:
                     cores_seg = ["#ed1c24", "#c91620", "#a91019", "#e2444c", "#b85c63", "#686f7a"]
-                    fig_seg = px.bar(seg_dash, x="_valor", y="_segmento", orientation="h", text="_valor", color="_segmento", color_discrete_sequence=cores_seg)
-                    fig_seg.update_traces(texttemplate="R$ %{x:,.0f}", textposition="outside", cliponaxis=False, marker_line_width=0)
+                    _total_seg = base_dash["_valor"].sum()
+                    seg_dash = seg_dash.assign(_rotulo=[f"R$ {num_br(v)}   {pct_br(v / _total_seg * 100 if _total_seg else 0)}" for v in seg_dash["_valor"]])
+                    fig_seg = px.bar(seg_dash, x="_valor", y="_segmento", orientation="h", text="_rotulo", color="_segmento", color_discrete_sequence=cores_seg)
+                    fig_seg.update_traces(texttemplate="%{text}", textposition="outside", cliponaxis=False, marker_line_width=0)
                     fig_seg.update_layout(showlegend=False, xaxis_title="", yaxis_title="", margin=dict(l=0,r=32,t=2,b=4))
-                    fig_seg.update_xaxes(showticklabels=False, showgrid=False, zeroline=False)
+                    fig_seg.update_xaxes(showticklabels=False, showgrid=False, zeroline=False, range=[0, max(seg_dash["_valor"].max(), 1) * 1.9])
                     st.plotly_chart(estilo_dashboard(fig_seg, 222), use_container_width=True, config={"displayModeBar": False}, key="dashboard_composicao_segmento")
                 else:
                     st.info("Não há segmentos na seleção atual.")
@@ -2155,11 +2566,12 @@ if aba_ativa == ABA_DADOS:
 
 # O assistente já foi renderizado no início da área principal para permanecer
 # disponível independentemente da seção selecionada.
+_atualizado_em = datetime.now(ZoneInfo("America/Sao_Paulo")).strftime("%d/%m/%Y %H:%M")
 st.markdown(
-    """
+    f"""
     <footer class="intech-footer">
       <div class="intech-footer-brand"><b>▮▮▮</b><span>Intech Machine</span><span style="color:#60666c">|</span><span>Painel Interativo de Vendas</span></div>
-      <div class="intech-footer-muted">Dados atualizados: conforme a base carregada</div>
+      <div class="intech-footer-muted">Dados atualizados em: {_atualizado_em}</div>
     </footer>
     """,
     unsafe_allow_html=True,
