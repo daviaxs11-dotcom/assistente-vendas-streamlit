@@ -1,5 +1,4 @@
-
- # assistente_ia.py
+# assistente_ia.py
 
 # Assistente de vendas (Gemini) para o painel_vendas.py, em DUAS requisições:
 
@@ -11,7 +10,7 @@
 
 #   2) EXECUÇÃO LOCAL: este código valida o plano (lista de dimensões/métricas permitidas), executa as
 
-#      consultas no DataFrame filtrado do painel e gera tabelas agregadas.
+#      consultas na base completa e gera tabelas agregadas, sem herdar filtros visuais do painel.
 
 #   3) RESPOSTA: a IA recebe a pergunta + as tabelas calculadas e escreve a resposta.
 
@@ -64,7 +63,7 @@ LIMITE_MAXIMO = 200          # máximo de linhas por consulta
 MAX_LINHAS_TOTAIS = 300      # máximo de linhas somando todas as consultas
 
 MAX_VALORES_LISTADOS = 40    # valores listados no esquema para dimensões pequenas
-MIN_REGISTROS_GRUPO = 5     # grupos abaixo desse tamanho não são enviados ao Gemini
+MIN_REGISTROS_GRUPO_PRIVACIDADE = 5  # grupos menores não são enviados ao Gemini
 
 TURNOS_HISTORICO = 4         # turnos anteriores enviados ao planejador
 
@@ -98,7 +97,7 @@ FORMATO:
 
       "metricas": ["faturamento", "quantidade", "preco_medio"],
 
-      "filtros": [{"dimensao": "produto", "operador": "contem", "valores": ["GP2000"]}],
+      "filtros": [{"dimensao": "sku", "operador": "igual", "valores": ["GP2000"]}],
 
       "periodo": {"inicio": "2026-01-01", "fim": "2026-12-31"},
 
@@ -130,15 +129,14 @@ REGRAS:
 
    Nunca tente descobrir nomes reais.
 
-3. Para produtos, use o texto que aparece na pergunta com o operador "contem",
-
-   a menos que o esquema liste o valor exato.
+3. Quando a pergunta trouxer um código identificador exato, como BP500, SKU ou código de produto, use o operador "igual" e filtre pela dimensão mais específica disponível (priorize SKU/código; se não houver, use produto). Não use "contem" para códigos exatos. Use "contem" somente quando o usuário pedir uma busca parcial por descrição/nome. Se a pergunta trouxer um identificador pseudonimizado como "Dado 1", use esse identificador exatamente como valor do filtro. Não invente códigos nem substitua o código citado por outro.
 
 4. Use "periodo" (datas ISO AAAA-MM-DD) para intervalos. Datas relativas ("mês passado",
 
    "este ano") devem ser calculadas a partir de "hoje" no esquema. Se a pergunta não cita
 
-   período, não envie "periodo": os dados já respeitam os filtros ativos do painel.
+   período, não envie "periodo": considere toda a base recebida. Os filtros visuais
+   do painel não se aplicam às consultas do assistente; filtre apenas conforme a pergunta.
 
 5. Para "última compra" ou "última data", use "somente_ultima_data": true com a métrica
 
@@ -183,7 +181,8 @@ Responda sempre em português do Brasil.
 
 Você recebe a pergunta do usuário e RESULTADOS de consultas já calculadas localmente
 
-sobre os dados de vendas (já respeitando os filtros ativos do painel).
+sobre toda a base de vendas recebida. Os filtros visuais do painel não se aplicam às
+consultas do assistente; somente os filtros explicitamente definidos na pergunta são usados.
 
 REGRAS OBRIGATÓRIAS:
 
@@ -195,7 +194,7 @@ REGRAS OBRIGATÓRIAS:
 
    e diga qual dado faltou. Se uma consulta voltou com 0 linhas, informe que não há vendas
 
-   para aqueles critérios nos filtros ativos; não use outros números para preencher.
+   para aqueles critérios na base de vendas consultada; não use outros números para preencher.
 
 3. Valores monetários em reais (R$), com duas casas decimais, no padrão brasileiro.
 
@@ -364,15 +363,43 @@ def formatar_moeda(valor):
 
 # ============================================================
 
+# LISTA PERMITIDA: cabeçalhos fora desta lista não são disponibilizados ao assistente.
+COLUNAS_PERMITIDAS = {normalizar(nome) for nome in (
+    "Classe Produto", "Cliente Gerencial", "Grupo Empresarial", "Empresa", "Ano-Mês", "Ano-Mes",
+    "Ano Fat.", "Mês Fat.", "Mes Fat.", "Trimestre", "Nº Pedido", "No Pedido", "Data Pedido",
+    "Produto", "Voltagem", "Qtde", "Quantidade", "Vlr unitário", "Vlr unitario",
+    "Vlr total dos produtos", "Data Faturamento", "IPI", "Valor Bruto da NF", "ST", "Total Bruto",
+    "Comissão Gerada", "Comissao Gerada", "Representante", "Tipo de Operação", "Tipo de Operacao",
+    "Departamento", "Vendedor atual do cadastro", "Gerente região Venda", "Gerente regiao Venda",
+    "Gerente região Cadastro", "Gerente regiao Cadastro", "Status Pedido", "Status Faturamento",
+    "Segmento", "Porte", "SKU", "Cidade", "Estado", "Região", "Regiao",
+)}
+COLUNAS_TEMPO_PRESERVADAS = {normalizar(nome) for nome in (
+    "Ano-Mês", "Ano-Mes", "Ano Fat.", "Mês Fat.", "Mes Fat.", "Trimestre", "Data Pedido", "Data Faturamento",
+)}
+COLUNAS_VALOR_PRESERVADAS = {normalizar(nome) for nome in (
+    "Qtde", "Quantidade", "Vlr unitário", "Vlr unitario", "Vlr total dos produtos", "IPI",
+    "Valor Bruto da NF", "ST", "Total Bruto", "Comissão Gerada", "Comissao Gerada",
+)}
+
+# Colunas auxiliares criadas localmente pelo painel_vendas.py.
+# São aceitas apenas quando existem no DataFrame recebido; não liberam outras colunas da base.
+COLUNAS_INTERNAS_PERMITIDAS = {
+    normalizar(nome) for nome in (
+        "_valor", "_quantidade", "_data", "_cliente", "_produto",
+        "_vendedor", "_segmento",
+    )
+}
+
 # prefixo != None: dado pessoal/comercial sensível, sempre enviado como "Prefixo N".
 
 DIMENSOES_TEXTO = {
 
     "cliente": {"rotulo": "cliente gerencial", "aliases": ["Cliente Gerencial", "Cliente"], "prefixo": "Cliente"},
 
-    "produto": {"rotulo": "produto/descrição comercial", "aliases": ["Produto", "Descrição Produto", "Descricao Produto"], "prefixo": "Dado"},
+    "produto": {"rotulo": "produto/descrição comercial", "aliases": ["Produto", "Descrição Produto", "Descricao Produto", "Nome Produto", "Nome do Produto", "Descrição", "Descricao", "Produto/Descrição", "Produto/Descricao"], "prefixo": "Dado"},
 
-    "sku": {"rotulo": "código SKU do produto", "aliases": ["SKU", "Código Produto", "Codigo Produto", "Código SKU", "Codigo SKU"], "prefixo": "Dado"},
+    "sku": {"rotulo": "código SKU do produto", "aliases": ["SKU", "Código Produto", "Codigo Produto", "Código do Produto", "Codigo do Produto", "Cod Produto", "Cod. Produto", "Cod do Produto", "Cod. do Produto", "Código SKU", "Codigo SKU", "Cod SKU", "Cod. SKU", "Referência", "Referencia", "Código Item", "Codigo Item", "Cod Item", "Cod. Item"], "prefixo": "Dado"},
 
     "vendedor": {"rotulo": "vendedor", "aliases": ["Vendedor", "Representante", "Vendedor atual do cadastro"], "prefixo": "Vendedor"},
 
@@ -382,33 +409,51 @@ DIMENSOES_TEXTO = {
 
     "gerente_regiao": {"rotulo": "gerente de região (cadastro)", "aliases": ["Gerente região Cadastro", "Gerente região"], "prefixo": "Gerente"},
 
-    "segmento": {"rotulo": "segmento", "aliases": ["Segmento"], "prefixo": None},
+    "segmento": {"rotulo": "segmento", "aliases": ["Segmento"], "prefixo": "Dado"},
 
     "empresa": {"rotulo": "empresa", "aliases": ["Empresa"], "prefixo": "Dado"},
 
-    "status_faturamento": {"rotulo": "status de faturamento", "aliases": ["Status Faturamento"], "prefixo": None},
+    "status_faturamento": {"rotulo": "status de faturamento", "aliases": ["Status Faturamento"], "prefixo": "Dado"},
 
     "departamento": {"rotulo": "departamento", "aliases": ["Departamento"], "prefixo": "Dado"},
 
 }
 
-# Cabeçalhos cuja informação de linha/valor deve ser tratada como sensível.
-# A lista é normalizada para aceitar diferenças de acento, caixa e espaços.
+# Somente campos com dados pessoais, credenciais ou identificadores financeiros são bloqueados.
+# Campos comerciais (cliente, produto, SKU, vendedor, empresa, pedido, departamento etc.)
+# continuam disponíveis; dimensões que possuem pseudônimo continuam pseudonimizadas.
 COLUNAS_SENSIVEIS = {
     normalizar(nome) for nome in (
-        "Classe Produto", "Cliente Gerencial", "Grupo Empresarial", "Empresa",
-        "Nº Pedido", "No Pedido", "Numero Pedido", "Data Pedido", "CNPJ",
-        "Cliente", "Produto", "N.F.", "NF", "Representante", "Departamento",
-        "Vendedor atual do cadastro", "Gerente região Venda",
-        "Gerente região Cadastro", "Parceiro Matriz", "CNPJ Matriz",
-        "Validação Venda", "Vendedor",
+        "CPF", "CNPJ", "CPF/CNPJ", "CNPJ Matriz", "CPF do Cliente",
+        "Documento", "Documento Pessoal", "E-mail", "Email",
+        "Telefone", "Celular", "Endereço", "Endereco",
+        "Chave Pix", "Conta Bancária", "Agência Bancária",
+        "Senha", "Login", "Data de Nascimento", "Nome Completo",
+        "Nome da Pessoa", "Nome do Contato", "Contato Pessoal",
     )
 }
 
-# Data Pedido pode ser usada para cálculo local, mas não deve expor o dia exato ao Gemini.
+# Termos específicos de dados sensíveis. Não incluir termos comerciais genéricos
+# como cliente, produto, SKU, pedido, empresa, vendedor ou departamento.
+TERMOS_BLOQUEADOS = (
+    "cpf", "cnpj", "documento pessoal", "documento do titular",
+    "email", "e-mail", "telefone", "celular", "endereco",
+    "chave pix", "conta bancaria", "agencia bancaria", "senha",
+    "login", "data de nascimento", "nome completo", "nome da pessoa",
+    "nome do contato", "contato pessoal",
+)
+
+def coluna_bloqueada(nome):
+    """Identifica apenas colunas que contêm dados pessoais/financeiros sensíveis."""
+    cabecalho = normalizar(nome)
+    if cabecalho in COLUNAS_SENSIVEIS:
+        return True
+    # Evita bloquear colunas comerciais só porque contêm palavras como cliente/produto.
+    return any(termo in cabecalho for termo in TERMOS_BLOQUEADOS)
+
+# A data do pedido não é, por si só, um dado pessoal sensível.
 def _data_pedido_sensivel(cols):
-    origem = cols.get("data")
-    return bool(origem and normalizar(origem) in {normalizar("Data Pedido")})
+    return False
 
 TEMPO_AGRUPAR = ["ano", "trimestre", "mes", "dia"]
 
@@ -472,28 +517,76 @@ def resolver_colunas(df, explicitas):
 
     )
 
-    # Disponibiliza todas as demais colunas sem enviar valores brutos de campos sensíveis.
+    # Métricas e datas também precisam pertencer à lista permitida.
+    for chave in ("valor", "qtd", "data"):
+        origem = cols.get(chave)
+        if origem and (
+            normalizar(origem) not in COLUNAS_PERMITIDAS
+            and normalizar(origem) not in COLUNAS_INTERNAS_PERMITIDAS
+        ):
+            cols[chave] = None
+
+    # Defesa adicional: uma coluna sensível nunca pode ser usada como valor,
+    # quantidade ou data, mesmo quando informada explicitamente na configuração.
+    for chave in ("valor", "qtd", "data"):
+        origem = cols.get(chave)
+        if origem and coluna_bloqueada(origem):
+            cols[chave] = None
+
+    # Guarda localmente as colunas sensíveis apenas para anonimizar a pergunta.
+    # Elas não ficam disponíveis para agrupamento, filtro ou consulta pelo Gemini.
+    colunas_anonimizacao = {}
+    for dim, cfg in DIMENSOES_TEXTO.items():
+        origem = cols.get(dim)
+        prefixo = cfg.get("prefixo")
+        if origem and prefixo and coluna_bloqueada(origem):
+            colunas_anonimizacao.setdefault(prefixo, set()).add(origem)
+
+    # Também considera colunas bloqueadas que não estejam mapeadas como dimensão padrão.
+    for nome in df.columns:
+        if coluna_bloqueada(nome):
+            colunas_anonimizacao.setdefault("Dado", set()).add(nome)
+
+    cols["_colunas_anonimizacao"] = {
+        prefixo: sorted(nomes) for prefixo, nomes in colunas_anonimizacao.items()
+    }
+
+    # Bloqueia dimensões sensíveis antes de construir o esquema enviado ao Gemini.
+    # O DataFrame original permanece local e não é alterado.
+    for dim in DIMENSOES_TEXTO:
+        origem = cols.get(dim)
+        if origem and (
+            coluna_bloqueada(origem)
+            or (
+                normalizar(origem) not in COLUNAS_PERMITIDAS
+                and normalizar(origem) not in COLUNAS_INTERNAS_PERMITIDAS
+            )
+        ):
+            cols[dim] = None
+        elif origem and normalizar(origem) not in COLUNAS_TEMPO_PRESERVADAS and normalizar(origem) not in COLUNAS_VALOR_PRESERVADAS:
+            # Todas as dimensões categóricas permitidas são pseudonimizadas.
+            cfg = DIMENSOES_TEXTO[dim]
+            if not cfg.get("prefixo"):
+                cfg["prefixo"] = "Dado"
+
     reservadas = {v for k, v in cols.items() if isinstance(v, str) and not k.startswith("_")}
     dinamicas, prefixos_sensiveis, numericas = {}, {}, {}
     for indice, nome in enumerate(df.columns, start=1):
-        if nome in reservadas:
+        cabecalho = normalizar(nome)
+        # Lista permitida: colunas não listadas não são expostas ao assistente.
+        if cabecalho not in COLUNAS_PERMITIDAS or nome in reservadas or coluna_bloqueada(nome):
             continue
         chave = f"campo_{indice}"
         dinamicas[chave] = nome
-        cab = normalizar(nome)
-        termos_sensiveis = (
-            "cliente", "pessoa", "nome", "cpf", "cnpj", "documento", "email", "e-mail",
-            "telefone", "celular", "contato", "endereco", "responsavel", "vendedor",
-            "representante", "gerente", "usuario", "login", "matricula", "chave pix",
-            "banco", "agencia", "conta bancaria", "pedido", "parceiro", "validacao",
-            "classe produto", "grupo empresarial", "data pedido", "nf", "n.f.",
-            "sku", "codigo sku", "código sku", "codigo produto", "código produto",
-        )
-        if cab in COLUNAS_SENSIVEIS or any(termo in cab for termo in termos_sensiveis):
-            prefixos_sensiveis[chave] = "Dado"
         serie = df[nome]
-        if pd.api.types.is_numeric_dtype(serie) and not pd.api.types.is_bool_dtype(serie):
+        if cabecalho in COLUNAS_TEMPO_PRESERVADAS:
+            continue
+        if cabecalho in COLUNAS_VALOR_PRESERVADAS:
+            # Valores podem vir como texto formatado (ex.: "R$ 1.234,56"); a conversão numérica é local.
             numericas[chave] = nome
+        else:
+            # Identificadores e categorias (inclusive números de pedido) viram Dado N.
+            prefixos_sensiveis[chave] = "Dado"
     cols["_dinamicas"] = dinamicas
     cols["_prefixos_sensiveis"] = prefixos_sensiveis
     cols["_numericas"] = numericas
@@ -742,6 +835,14 @@ def nomes_para_anonimizar(quadro):
 
     saida = {}
 
+    # Colunas bloqueadas são usadas exclusivamente para substituir valores reais na pergunta.
+    # Nenhum desses campos é incluído no esquema de consulta enviado ao Gemini.
+    for prefixo, colunas in quadro.cols.get("_colunas_anonimizacao", {}).items():
+        for coluna in colunas:
+            if coluna in quadro._df.columns:
+                valores = quadro._df[coluna].dropna().astype(str).str.strip().unique()
+                saida.setdefault(prefixo, set()).update(valores)
+
     for dim, cfg in DIMENSOES_TEXTO.items():
 
         prefixo = cfg["prefixo"]
@@ -863,8 +964,11 @@ def montar_esquema(quadro):
         metricas["data_ultima"] = "última data"
 
     for dim, origem in cols.get("_numericas", {}).items():
-        metricas[f"soma_{dim}"] = f"soma da coluna numérica {origem!r} (ID {dim})"
-        metricas[f"media_{dim}"] = f"média da coluna numérica {origem!r} (ID {dim})"
+        # Defesa adicional: uma coluna bloqueada nunca vira métrica disponível à IA.
+        if coluna_bloqueada(origem):
+            continue
+        metricas[f"soma_{dim}"] = f"soma da coluna numérica autorizada (ID {dim})"
+        metricas[f"media_{dim}"] = f"média da coluna numérica autorizada (ID {dim})"
     esquema["metricas"] = metricas
 
     esquema["operadores_de_filtro"] = ["igual", "contem", "diferente"]
@@ -1270,9 +1374,25 @@ def executar_consulta(quadro, consulta, mapa, limite_maximo=LIMITE_MAXIMO):
     }
 
     if dados.empty:
-
         resultado.update({"linhas_totais": 0, "linhas_retornadas": 0, "truncado": False, "linhas": []})
+        return resultado
 
+    # Se a pergunta filtra uma dimensão comercial específica, não exponha totais
+    # de grupos com menos de cinco registros. Diferenciamos esse bloqueio de zero
+    # resultados reais para não exibir uma mensagem enganosa de ausência de vendas.
+    filtros_comerciais = [f for f in filtros if f["dimensao"] not in FILTROS_TEMPO]
+    if len(dados) < MIN_REGISTROS_GRUPO_PRIVACIDADE and filtros_comerciais:
+        resultado["totais_do_filtro"] = {
+            "registros": None, "faturamento": None,
+            **({"quantidade": None} if quadro.tem_quantidade else {}),
+        }
+        resultado["avisos"] = avisos + [
+            f"Resultado ocultado por privacidade: menos de {MIN_REGISTROS_GRUPO_PRIVACIDADE} registros correspondem aos critérios."
+        ]
+        resultado.update({
+            "linhas_totais": 0, "linhas_retornadas": 0, "truncado": False,
+            "linhas": [], "oculto_por_privacidade": True,
+        })
         return resultado
 
     chaves = [quadro.coluna(d) for d in agrupar]
@@ -1345,25 +1465,18 @@ def executar_consulta(quadro, consulta, mapa, limite_maximo=LIMITE_MAXIMO):
         agg["preco_medio"] = agg["faturamento"] / agg["quantidade"].where(agg["quantidade"] > 0)
 
     if chaves:
-
         agg = agg.rename(columns=dict(zip(chaves, agrupar)))
-        grupos_pequenos = agg["_registros_privacidade"] < MIN_REGISTROS_GRUPO
-        quantidade_grupos_ocultos = int(grupos_pequenos.sum())
-        if quantidade_grupos_ocultos:
-            agg = agg.loc[~grupos_pequenos].copy()
-            aviso_privacidade = (
-                f"Grupos com menos de {MIN_REGISTROS_GRUPO} registros foram ocultados por privacidade. "
-                "Os totais gerais também foram omitidos para evitar reconstrução por diferença."
-            )
-            avisos.append(aviso_privacidade)
-            resultado["avisos"] = avisos
-            resultado["totais_do_filtro"] = {
-                "aviso": "Totais gerais omitidos porque pelo menos um grupo foi ocultado por privacidade."
-            }
+        # A regra de privacidade deve ser executada, não apenas descrita no prompt.
+        linhas_antes_privacidade = len(agg)
+        agg = agg[agg["_registros_privacidade"] >= MIN_REGISTROS_GRUPO_PRIVACIDADE].copy()
+        grupos_ocultados = linhas_antes_privacidade - len(agg)
         agg = agg.drop(columns=["_registros_privacidade"])
-
+        if grupos_ocultados:
+            avisos.append(
+                f"{grupos_ocultados} grupo(s) com menos de "
+                f"{MIN_REGISTROS_GRUPO_PRIVACIDADE} registros foram ocultados por privacidade."
+            )
     else:
-
         agg = agg.drop(columns=["_tudo"])
 
     # Ordenação: pedida pelo plano; senão cronológica (se agrupa por tempo) ou pela primeira métrica (maior primeiro).
@@ -1556,6 +1669,28 @@ def consultar_gemini(prompt, chave_api, sistema=INSTRUCOES_IA, json_mode=False, 
 
 # ============================================================
 
+def _total_registros_seguro(resultado):
+    """Retorna a contagem de registros como inteiro, ou None quando foi ocultada/inválida."""
+    if not isinstance(resultado, dict):
+        return None
+    totais = resultado.get("totais_do_filtro")
+    if not isinstance(totais, dict):
+        return None
+    valor = totais.get("registros")
+    try:
+        if valor is None or isinstance(valor, bool):
+            return None
+        return int(valor)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _todos_resultados_vazios(resultados):
+    """True somente quando existem resultados estruturados e todos têm zero registros reais."""
+    validos = [r for r in resultados if isinstance(r, dict) and "totais_do_filtro" in r and "linhas" in r]
+    return bool(validos) and all(_total_registros_seguro(r) == 0 for r in validos)
+
+
 def processar_pergunta(df, cols, pergunta, mapa, historico, gerar, etapa=None):
 
     """Planeja -> executa localmente -> responde.
@@ -1626,6 +1761,18 @@ def processar_pergunta(df, cols, pergunta, mapa, historico, gerar, etapa=None):
 
     detalhes["resultados"] = resultados
 
+    # Se todas as consultas retornarem zero registros, não chamar o Gemini
+    # para evitar uma resposta especulativa; a interface limpará o contexto.
+    consultas_sem_registros = _todos_resultados_vazios(resultados)
+    if consultas_sem_registros:
+        texto = "nao foram encontrados registros"
+        return {
+            "resposta": texto,
+            "resposta_segura": texto,
+            "detalhes": detalhes,
+            "memoria": None,
+        }
+
     # Requisição 2: a IA responde com os dados fornecidos.
 
     aviso_etapa("Escrevendo a resposta...")
@@ -1690,8 +1837,9 @@ def exibir_assistente_ia(
 
     """Desenha o assistente no contêiner atual.
 
-    Passe o DataFrame JÁ FILTRADO: o assistente só enxerga o que está nos filtros ativos.
+    Passe a base COMPLETA de vendas, sem aplicar os filtros visuais do painel.
 
+    O assistente cria filtros próprios a partir da pergunta do usuário e os aplica localmente.
     `colunas_extras` aceita {"empresa": "...", "status_faturamento": "...", "departamento": "...",
 
     "gerente_regiao": "...", "representante": "...", "vendedor_cadastro": "..."}; o que faltar é
@@ -1726,57 +1874,239 @@ def exibir_assistente_ia(
 
     st.session_state.setdefault(chave_map, {})
 
-    st.subheader("🤖 Assistente de Vendas")
+    # Assistente flutuante: fica sobre o painel, fixo no canto inferior direito.
+    # O estado aberto/fechado e a conversa permanecem no session_state entre reruns.
+    chave_aberto = f"ia_aberto_{sufixo}"
+    st.session_state.setdefault(chave_aberto, True)
+    aberto = bool(st.session_state[chave_aberto])
+    pergunta = ""
 
-    st.caption(
-
-        "A IA primeiro decide quais dados precisa; o painel calcula localmente e só então a IA responde. "
-
-        "Campos com possíveis dados pessoais são enviados como identificadores genéricos; os cálculos ocorrem localmente. "
-
-        "As respostas consideram os filtros ativos."
-
+    st.markdown(
+        """
+        <style>
+        /* Contêiner dedicado: o posicionamento é relativo à janela, não à coluna do dashboard. */
+        .st-key-ia_floating_widget {
+            position: fixed !important;
+            box-sizing: border-box !important;
+            display: block !important;
+            right: 20px !important;
+            bottom: 18px !important;
+            top: auto !important;
+            left: auto !important;
+            width: min(355px, calc(100vw - 28px)) !important;
+            max-width: calc(100vw - 28px) !important;
+            max-height: min(78vh, 720px) !important;
+            overflow: hidden !important;
+            z-index: 999999 !important;
+            background: linear-gradient(145deg, rgba(26, 8, 11, .985) 0%, rgba(7, 9, 11, .985) 66%, rgba(16, 17, 19, .99) 100%) !important;
+            border: 1px solid #403238 !important;
+            border-radius: 15px !important;
+            box-shadow: 0 18px 55px rgba(0,0,0,.62), 0 0 0 1px rgba(237,28,36,.08), inset 0 1px rgba(255,255,255,.035) !important;
+            padding: 12px 13px 11px !important;
+            backdrop-filter: blur(16px);
+        }
+        .st-key-ia_floating_widget [data-testid="stMarkdownContainer"] {
+            color: #edf0f2;
+            line-height: 1.35;
+        }
+        .st-key-ia_floating_widget [data-testid="stVerticalBlock"] { gap: .48rem; }
+        .st-key-ia_floating_widget [data-testid="stTextInput"] input {
+            background: #0b0e10 !important; color: #f5f6f7 !important;
+            border: 1px solid #3a3e43 !important; border-radius: 8px !important;
+            min-height: 38px; font-size: .82rem;
+        }
+        .st-key-ia_floating_widget [data-testid="stTextInput"] input:focus {
+            border-color: #ed1c24 !important; box-shadow: 0 0 0 1px #ed1c24 !important;
+        }
+        .st-key-ia_floating_widget [data-testid="stForm"] {
+            border: 0 !important; padding: 0 !important; background: transparent !important;
+        }
+        .st-key-ia_floating_widget [data-testid="stFormSubmitButton"] button {
+            min-height: 38px; padding: 0 10px;
+            background: linear-gradient(135deg, #f21b24, #b80f18) !important;
+            color: #fff !important; border: 1px solid #f22a32 !important;
+            border-radius: 8px !important; font-size: 1.1rem; font-weight: 700;
+        }
+        .st-key-ia_floating_widget [data-testid="stFormSubmitButton"] button:hover {
+            background: #ff3038 !important; border-color: #ff6268 !important;
+        }
+        .st-key-ia_floating_widget [data-testid="stButton"] button {
+            background: #111417 !important; border: 1px solid #353a40 !important;
+            color: #cdd1d5 !important; border-radius: 8px !important;
+            padding: 0 8px !important; min-height: 30px;
+        }
+        .st-key-ia_floating_widget [data-testid="stButton"] button:hover {
+            border-color: #ed1c24 !important; color: #fff !important;
+        }
+        .st-key-ia_floating_widget [data-testid="stChatMessage"] {
+            background: #0c0f11 !important; border: 1px solid #282d32 !important;
+            border-radius: 9px !important; padding: 8px 10px !important;
+        }
+        .st-key-ia_floating_widget [data-testid="stChatMessageContent"] p {
+            font-size: .79rem; line-height: 1.35;
+        }
+        .st-key-ia_floating_widget [data-testid="stExpander"] {
+            border-color: #2c3035 !important; border-radius: 8px !important;
+        }
+        .st-key-ia_floating_widget > div { min-width: 0 !important; }
+        .ia-assistant-marker { height: 0; margin: 0; padding: 0; overflow: hidden; }
+        .ia-card-title { display:flex; align-items:center; gap:9px; color:#fff; font-weight:700; font-size:1rem; letter-spacing:-.02em; min-height:30px; }
+        .ia-card-icon { display:inline-flex; align-items:center; justify-content:center; color:#fff; background:linear-gradient(145deg,#f21b24,#a90c14); width:27px; height:27px; border-radius:9px; font-size:15px; box-shadow:0 3px 12px rgba(237,28,36,.24); }
+        .ia-greeting { display:flex; align-items:flex-start; gap:9px; background:linear-gradient(135deg,#121518,#0b0d0f); border:1px solid #292e33; border-radius:10px; padding:10px; margin:1px 0 3px; }
+        .ia-robot { flex:0 0 32px; width:32px; height:32px; display:flex; align-items:center; justify-content:center; border-radius:50%; background:#25090c; border:1px solid #5a171c; font-size:20px; }
+        .ia-greeting-text { color:#e8eaec; font-size:.78rem; line-height:1.45; }
+        .ia-greeting-text strong { color:#fff; }
+        .ia-examples { color:#b9bec4; font-size:.72rem; line-height:1.48; padding-top:1px; }
+        .ia-examples strong { color:#f3a431; font-weight:600; }
+        .ia-muted { color:#9da4ab; font-size:.69rem; line-height:1.35; }
+        /* Minimizado: mantém apenas a barra do título e o botão para reabrir. */
+        .st-key-ia_floating_widget:has(.ia-assistant-marker.ia-minimized) {
+            width: min(260px, calc(100vw - 28px)) !important;
+            max-height: 72px !important;
+            padding: 9px 11px !important;
+            overflow: hidden !important;
+        }
+        @media (max-width: 600px) {
+            .st-key-ia_floating_widget {
+                right: 10px !important; bottom: 10px !important;
+                width: calc(100vw - 20px) !important; max-width: calc(100vw - 20px) !important;
+                max-height: 72vh !important; padding: 10px !important;
+            }
+            .st-key-ia_floating_widget:has(.ia-assistant-marker.ia-minimized) {
+                width: min(245px, calc(100vw - 20px)) !important;
+                max-width: min(245px, calc(100vw - 20px)) !important;
+                max-height: 68px !important;
+            }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
 
-    if st.button("🗑️ Limpar conversa", key=f"limpar_ia_{sufixo}"):
+    # st.container(key=...) só está disponível em versões mais recentes do Streamlit.
+    # Em versões antigas, o assistente continua funcional, mas aparece no fluxo da página
+    # em vez de flutuar sobre o painel.
+    try:
+        import inspect
+        suporta_chave_container = "key" in inspect.signature(st.container).parameters
+    except (TypeError, ValueError):
+        versao_streamlit = tuple(
+            int(parte) for parte in re.match(r"^(\d+)\.(\d+)", getattr(st, "__version__", "0.0")).groups()
+        ) if re.match(r"^(\d+)\.(\d+)", getattr(st, "__version__", "0.0")) else (0, 0)
+        suporta_chave_container = versao_streamlit >= (1, 40)
 
-        st.session_state[chave_msgs] = []
+    container_assistente = (
+        st.container(key="ia_floating_widget", border=False)
+        if suporta_chave_container else st.container(border=False)
+    )
+    with container_assistente:
+        classe_marcador = "ia-assistant-marker" if aberto else "ia-assistant-marker ia-minimized"
+        st.markdown(f'<div class="{classe_marcador}"></div>', unsafe_allow_html=True)
 
-        st.session_state[chave_mem] = []
+        if aberto:
+            cab_esq, cab_limpar, cab_minimizar = st.columns([6, 1, 1], gap="small")
+            with cab_esq:
+                st.markdown(
+                    '<div class="ia-card-title"><span class="ia-card-icon">✦</span>'
+                    '<span>Assistente de IA</span></div>',
+                    unsafe_allow_html=True,
+                )
+            with cab_limpar:
+                limpar = st.button(
+                    "↻", key=f"limpar_ia_{sufixo}",
+                    help="Limpar conversa e memória contextual", use_container_width=True,
+                )
+            with cab_minimizar:
+                minimizar = st.button(
+                    "−", key=f"minimizar_ia_{sufixo}",
+                    help="Minimizar assistente", use_container_width=True,
+                )
+            if limpar:
+                st.session_state[chave_msgs] = []
+                st.session_state[chave_mem] = []
+                st.session_state[chave_map] = {}
+                st.rerun()
+            if minimizar:
+                st.session_state[chave_aberto] = False
+                st.rerun()
 
-        st.session_state[chave_map] = {}
+            with st.container(height=220, border=False):
+                if not st.session_state[chave_msgs]:
+                    st.markdown(
+                        '<div class="ia-greeting"><div class="ia-robot">🤖</div>'
+                        '<div class="ia-greeting-text">Olá! Eu sou o assistente de vendas da '
+                        '<strong>Intech Machine</strong>. Pergunte sobre faturamento, clientes, '
+                        'produtos e muito mais!</div></div>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    for mensagem in st.session_state[chave_msgs][-8:]:
+                        with st.chat_message(mensagem["role"]):
+                            st.markdown(mensagem["content"])
+                            if mensagem.get("detalhes"):
+                                with st.expander("Ver consulta e dados utilizados"):
+                                    st.caption(
+                                        "Plano e agregações calculados localmente; nomes comerciais "
+                                        "são pseudonimizados antes do envio à IA."
+                                    )
+                                    st.json(mensagem["detalhes"], expanded=False)
 
-        st.rerun()
+            with st.form(key=f"form_pergunta_ia_{sufixo}", clear_on_submit=True):
+                entrada_col, enviar_col = st.columns([5, 1], gap="small")
+                with entrada_col:
+                    pergunta_digitada = st.text_input(
+                        "Pergunta ao assistente", placeholder="Digite sua pergunta...",
+                        label_visibility="collapsed", key=f"entrada_texto_ia_{sufixo}",
+                    )
+                with enviar_col:
+                    enviar = st.form_submit_button("➤", use_container_width=True)
 
-    with st.container(height=380, border=True):
+            if not st.session_state[chave_msgs]:
+                st.markdown(
+                    '<div class="ia-examples"><strong>✦ Exemplos de perguntas</strong><br>'
+                    '• Qual o faturamento do último trimestre?<br>'
+                    '• Quais são os 5 maiores clientes?<br>'
+                    '• Qual produto mais vendeu?<br>'
+                    '• Mostre a evolução de um cliente.</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    '<div class="ia-muted">O assistente consulta a base completa e aplica seus próprios filtros.</div>',
+                    unsafe_allow_html=True,
+                )
 
-        if not st.session_state[chave_msgs]:
-
-            st.caption('Ex.: "Qual o preço médio do produto X por mês em 2026?"')
-
-        for mensagem in st.session_state[chave_msgs]:
-
-            with st.chat_message(mensagem["role"]):
-
-                st.markdown(mensagem["content"])
-
-                if mensagem.get("detalhes"):
-
-                    with st.expander("🔎 O que foi consultado"):
-
-                        st.caption("Plano e dados enviados ao Gemini (nomes substituídos por identificadores genéricos).")
-
-                        st.json(mensagem["detalhes"], expanded=False)
-
-    pergunta = st.chat_input("Pergunte sobre as vendas...", key=f"pergunta_ia_{sufixo}")
+            with st.expander("Privacidade e funcionamento", expanded=False):
+                st.caption(
+                    "A IA planeja a consulta usando campos autorizados. Os cálculos são executados "
+                    "localmente e somente resultados agregados são enviados para gerar a resposta. "
+                    "Campos pessoais e nomes comerciais são protegidos por pseudonimização. "
+                    "O assistente consulta a base completa e aplica os filtros definidos na pergunta, independentemente dos filtros visuais do painel."
+                )
+            pergunta = pergunta_digitada.strip() if enviar and pergunta_digitada else ""
+        else:
+            cab_esq, cab_abrir = st.columns([6, 1], gap="small")
+            with cab_esq:
+                st.markdown(
+                    '<div class="ia-card-title"><span class="ia-card-icon">✦</span>'
+                    '<span>Assistente de IA</span></div>',
+                    unsafe_allow_html=True,
+                )
+            with cab_abrir:
+                abrir = st.button(
+                    "+", key=f"abrir_ia_{sufixo}",
+                    help="Abrir assistente", use_container_width=True,
+                )
+            if abrir:
+                st.session_state[chave_aberto] = True
+                st.rerun()
 
     if not pergunta:
-
         return
 
     if df_vendas.empty:
 
-        st.warning("Não há dados de vendas nos filtros atuais.")
+        st.warning("A base completa não contém registros para consulta.")
 
         return
 
@@ -1810,30 +2140,138 @@ def exibir_assistente_ia(
 
         return consultar_gemini(prompt, chave_api, sistema=sistema, json_mode=json_mode, temperatura=0.0 if json_mode else 0.2)
 
+    
     try:
-
         with st.spinner("Analisando..."):
-
             saida = processar_pergunta(
-
-                df_vendas, cols, pergunta, st.session_state[chave_map], st.session_state[chave_mem], gerar
-
+                df_vendas,
+                cols,
+                pergunta,
+                st.session_state[chave_map],
+                st.session_state[chave_mem],
+                gerar,
             )
 
     except Exception as exc:
+        # Limpar somente a memória contextual.
+        st.session_state[chave_mem] = []
+        st.session_state[chave_map] = {}
 
-        st.error(f"Não foi possível obter a resposta do assistente: {exc}")
-
+        # Registrar o aviso na conversa para que ele não desapareça no rerun.
+        st.session_state[chave_msgs] = (
+            st.session_state[chave_msgs]
+            + [
+                {"role": "user", "content": pergunta},
+                {
+                    "role": "assistant",
+                    "content": (
+                        f"Não foi possível obter a resposta do assistente: {exc}. "
+                        "A memória contextual foi limpa, mas as mensagens anteriores foram mantidas."
+                    ),
+                },
+            ]
+        )[-40:]
+        st.rerun()
         return
 
-    st.session_state[chave_msgs] = (st.session_state[chave_msgs] + [
+    # Verificar se a resposta e as consultas são válidas.
+    detalhes = saida.get("detalhes") or {}
+    plano = detalhes.get("plano") or []
+    resultados = detalhes.get("resultados") or []
+    avisos = detalhes.get("avisos") or []
 
-        {"role": "user", "content": pergunta},
+    # Separar resultado vazio de erro de estrutura/plano.
+    resultados_estruturados = [
+        resultado
+        for resultado in resultados
+        if isinstance(resultado, dict)
+        and "linhas" in resultado
+        and "totais_do_filtro" in resultado
+    ]
 
-        {"role": "assistant", "content": saida["resposta"], "detalhes": saida["detalhes"]},
+    sem_registros = _todos_resultados_vazios(resultados_estruturados)
 
-    ])[-40:]
+    if sem_registros:
+        # Resultado vazio: limpar o contexto e o mapa de pseudônimos,
+        # preservando as mensagens anteriores visíveis na conversa.
+        st.session_state[chave_mem] = []
+        st.session_state[chave_map] = {}
+        st.session_state[chave_msgs] = (
+            st.session_state[chave_msgs]
+            + [
+                {"role": "user", "content": pergunta},
+                {"role": "assistant", "content": "nao foram encontrados registros"},
+            ]
+        )[-40:]
+        st.rerun()
+        return
 
-    st.session_state[chave_mem] = (st.session_state[chave_mem] + [saida["memoria"]])[-TURNOS_HISTORICO * 2:]
+    resultados_ocultos = bool(resultados_estruturados) and all(
+        bool(r.get("oculto_por_privacidade"))
+        or (
+            isinstance(r.get("linhas"), list) and not r.get("linhas")
+            and isinstance(r.get("avisos"), list)
+            and any("privacidade" in str(a).casefold() for a in r.get("avisos", []))
+        )
+        for r in resultados_estruturados
+    )
+    if resultados_ocultos:
+        st.session_state[chave_msgs] = (
+            st.session_state[chave_msgs]
+            + [
+                {"role": "user", "content": pergunta},
+                {"role": "assistant", "content": "O resultado foi ocultado por privacidade porque corresponde a menos de 5 registros."},
+            ]
+        )[-40:]
+        st.rerun()
+        return
+
+    resultado_invalido = (
+        not plano
+        or not resultados_estruturados
+    )
+
+    if resultado_invalido:
+        # Manter as mensagens e limpar somente a memória contextual.
+        st.session_state[chave_mem] = []
+        st.session_state[chave_map] = {}
+
+        # Registrar o aviso no histórico visível: st.warning seguido de
+        # st.rerun() desaparece antes que o usuário consiga lê-lo.
+        st.session_state[chave_msgs] = (
+            st.session_state[chave_msgs]
+            + [
+                {"role": "user", "content": pergunta},
+                {
+                    "role": "assistant",
+                    "content": (
+                        "Não consegui reconhecer o nome informado ou a consulta "
+                        "retornou um resultado inválido/insuficiente. A memória "
+                        "contextual foi limpa para evitar reutilizar informações "
+                        "incorretas, mas as mensagens anteriores foram mantidas. "
+                        "Confira o nome do cliente ou produto e tente novamente."
+                    ),
+                },
+            ]
+        )[-40:]
+        st.rerun()
+        return
+
+    # Somente resultados válidos são adicionados à conversa.
+    st.session_state[chave_msgs] = (
+        st.session_state[chave_msgs]
+        + [
+            {"role": "user", "content": pergunta},
+            {
+                "role": "assistant",
+                "content": saida["resposta"],
+                "detalhes": detalhes,
+            },
+        ]
+    )[-40:]
+
+    st.session_state[chave_mem] = (
+        st.session_state[chave_mem] + [saida["memoria"]]
+    )[-TURNOS_HISTORICO * 2:]
 
     st.rerun()
