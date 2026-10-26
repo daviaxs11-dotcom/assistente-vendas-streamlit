@@ -148,7 +148,7 @@ COR_TEXTO_GRAFICO = "#e8eaed"
 
 
 def padronizar_grafico(fig, altura=None, margem=None, legenda=False):
-    """Layout único para TODOS os gráficos (dashboard e análises detalhadas)."""
+    """Aplica identidade visual Intech também às cores explícitas das séries."""
     fig.update_layout(
         template="plotly_dark",
         colorway=PALETA_GRAFICOS,
@@ -156,7 +156,7 @@ def padronizar_grafico(fig, altura=None, margem=None, legenda=False):
         plot_bgcolor="rgba(0,0,0,0)",
         font=dict(family="Inter, sans-serif", color=COR_TEXTO_GRAFICO, size=10),
         title=dict(font=dict(size=13, color="#f6f7f8"), x=0, xanchor="left"),
-        legend_title_text="",
+        legend=dict(title_text="", font=dict(family="Inter, sans-serif", color=COR_TEXTO_GRAFICO, size=9)),
         showlegend=legenda,
         hoverlabel=dict(bgcolor="#101316", font_color="#f6f6f6", bordercolor="#393f45"),
     )
@@ -164,14 +164,46 @@ def padronizar_grafico(fig, altura=None, margem=None, legenda=False):
         fig.update_layout(height=altura)
     if margem:
         fig.update_layout(margin=margem)
-    # Grade só no eixo dos valores: x nas barras horizontais, y nos demais gráficos.
-    horizontal = any(getattr(t, "orientation", None) == "h" for t in fig.data) or any(
-        getattr(t, "type", None) == "pie" for t in fig.data)
-    grade = dict(showgrid=True, gridcolor="rgba(140,150,160,.12)", zerolinecolor="rgba(140,150,160,.18)")
+
+    # O colorway do Plotly não substitui cores definidas diretamente nas séries.
+    # Sobrescrevemos essas cores para evitar barras azuis ou estilos antigos.
+    indice_cor = 0
+    for trace in fig.data:
+        tipo = getattr(trace, "type", "")
+        if tipo == "bar":
+            # Barras sempre no vermelho da marca, independentemente da cor original.
+            trace.update(marker=dict(color="#ed1c24", line=dict(color="#ed1c24", width=0)))
+        elif tipo in ("scatter", "scattergl"):
+            modo = getattr(trace, "mode", "") or ""
+            cor = PALETA_GRAFICOS[indice_cor % len(PALETA_GRAFICOS)]
+            if "lines" in modo:
+                trace.update(line=dict(color=cor, width=2))
+            if "markers" in modo:
+                trace.update(marker=dict(color=cor, line=dict(color=cor, width=0)))
+            indice_cor += 1
+        elif tipo == "pie":
+            trace.update(marker=dict(colors=PALETA_GRAFICOS, line=dict(color="#151719", width=1)))
+
+    # Grade discreta apenas no eixo de valores; rótulos e títulos uniformes.
+    horizontal = any(getattr(t, "orientation", None) == "h" for t in fig.data)
+    grade = dict(showgrid=True, gridcolor="rgba(140,150,160,.16)", zerolinecolor="rgba(140,150,160,.22)")
     sem_grade = dict(showgrid=False, zeroline=False)
-    fig.update_xaxes(**(grade if horizontal else sem_grade), title_font_size=10, tickfont_size=9)
-    fig.update_yaxes(**(sem_grade if horizontal else grade), title_font_size=10, tickfont_size=9)
+    fig.update_xaxes(**(grade if horizontal else sem_grade), title_font_size=10, tickfont_size=9,
+                     tickfont=dict(family="Inter, sans-serif", color=COR_TEXTO_GRAFICO, size=9))
+    fig.update_yaxes(**(sem_grade if horizontal else grade), title_font_size=10, tickfont_size=9,
+                     tickfont=dict(family="Inter, sans-serif", color=COR_TEXTO_GRAFICO, size=9))
     return fig
+
+
+def exibir_grafico_padronizado(fig, *args, **kwargs):
+    """Aplica a identidade visual Intech a qualquer gráfico antes de exibi-lo."""
+    legenda_existente = getattr(fig.layout, "showlegend", None)
+    if legenda_existente is None:
+        legenda_existente = len(fig.data) > 1 and any(
+            getattr(trace, "name", None) for trace in fig.data
+        )
+    padronizar_grafico(fig, legenda=bool(legenda_existente))
+    return st.plotly_chart(fig, *args, **kwargs)
 
 
 def formatar_eixos(fig, eixo_y=None):
@@ -454,8 +486,8 @@ hr { border-color: var(--intech-line) !important; margin: .65rem 0 !important; }
 
 /* Barra lateral */
 [data-testid="stSidebar"] {
-  min-width: 275px;
-  max-width: 275px;
+  min-width: 280px;
+  max-width: 280px;
   background: linear-gradient(180deg, #0c0f11 0%, #070809 72%, #050607 100%) !important;
   border-right: 1px solid var(--intech-line);
 }
@@ -878,6 +910,29 @@ div.st-key-aba_ativa [role="radiogroup"] label > div:first-child { display:none;
 [data-testid="stFormSubmitButton"] button { min-height:36px !important; padding:.25rem .45rem !important; border-radius:8px !important; }
 .ai-examples + div { margin-top:0 !important; }
 
+
+/* Menu lateral fixo: impede recolher/expandir pelo botão do Streamlit */
+[data-testid="stSidebarCollapseButton"],
+[data-testid="stSidebarHeader"] button,
+button[kind="header"] {
+  display: none !important;
+  visibility: hidden !important;
+  pointer-events: none !important;
+}
+[data-testid="stSidebar"] {
+  display: block !important;
+  min-width: 280px !important;
+  max-width: 280px !important;
+  width: 280px !important;
+  transform: none !important;
+  visibility: visible !important;
+}
+[data-testid="stSidebar"][aria-expanded="false"] {
+  margin-left: 0 !important;
+  width: 280px !important;
+  min-width: 280px !important;
+  transform: none !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -1477,7 +1532,7 @@ def grafico_tempo(base, granularidade, medida, titulo, chave="tempo"):
     fig.update_layout(xaxis_title="Período", yaxis_title="Valor (R$)" if medida == "_valor" else "Quantidade")
     if medida == "_valor":
         fig.update_yaxes(tickprefix="R$ ", tickformat=",.0f")
-    st.plotly_chart(formatar_eixos(fig), use_container_width=True, key=f"{chave}_{granularidade}_{medida}")
+    exibir_grafico_padronizado(formatar_eixos(fig), use_container_width=True, key=f"{chave}_{granularidade}_{medida}")
 
 
 if aba_ativa == ABA_PROJECOES:
@@ -1709,7 +1764,7 @@ if aba_ativa == ABA_PROJECOES:
         else:
             # Quantidade é exibida como número de unidades, nunca na escala monetária.
             fig_proj.update_yaxes(tickprefix="", ticksuffix="", tickformat=",.0f")
-        st.plotly_chart(
+        exibir_grafico_padronizado(
             fig_proj, use_container_width=True, config={"displayModeBar": False},
             key="grafico_projecao_probabilistica_mensal",
         )
@@ -1769,7 +1824,7 @@ if aba_ativa == ABA_VENDEDOR:
                     fig_vdash.update_layout(xaxis_title="Valor (R$)", yaxis_title="", margin=dict(l=2,r=34,t=8,b=12))
                     _tv, _tt = ticks_moeda_br(max(resumo_v_dash["_valor"].max(), 1) * 1.45, alvo=4, rotulador=rotulo_eixo_curto)
                     fig_vdash.update_xaxes(tickmode="array", tickvals=_tv, ticktext=_tt, range=[0, _tv[-1]])
-                    st.plotly_chart(estilo_dashboard(fig_vdash, 202), use_container_width=True, config={"displayModeBar": False}, key="dashboard_vendedor_valor")
+                    exibir_grafico_padronizado(estilo_dashboard(fig_vdash, 202), use_container_width=True, config={"displayModeBar": False}, key="dashboard_vendedor_valor")
                 with cv2:
                     st.markdown('<div class="dash-chart-caption">Quantidade por vendedor</div>', unsafe_allow_html=True)
                     fig_qdash = px.bar(resumo_q_dash, x="_quantidade", y="_vendedor", orientation="h", text="_quantidade", color_discrete_sequence=[GREY])
@@ -1777,7 +1832,7 @@ if aba_ativa == ABA_VENDEDOR:
                     fig_qdash.update_layout(xaxis_title="Quantidade", yaxis_title="", margin=dict(l=2,r=32,t=8,b=12))
                     _tv, _tt = ticks_moeda_br(max(resumo_q_dash["_quantidade"].max(), 1) * 1.35, alvo=4, rotulador=rotulo_eixo_curto)
                     fig_qdash.update_xaxes(tickmode="array", tickvals=_tv, ticktext=_tt, range=[0, _tv[-1]])
-                    st.plotly_chart(estilo_dashboard(fig_qdash, 202), use_container_width=True, config={"displayModeBar": False}, key="dashboard_vendedor_qtde")
+                    exibir_grafico_padronizado(estilo_dashboard(fig_qdash, 202), use_container_width=True, config={"displayModeBar": False}, key="dashboard_vendedor_qtde")
             else:
                 st.info("Adicione uma coluna de vendedor para visualizar este gráfico.")
 
@@ -1801,7 +1856,7 @@ if aba_ativa == ABA_VENDEDOR:
                                             hovertemplate="%{label}<br>R$ %{value:,.2f}<br>%{percent}<extra></extra>")
                     fig_share.update_layout(showlegend=False, margin=dict(l=0,r=0,t=2,b=2),
                                             annotations=[dict(text=f"Total<br>R$ {grand_total_dash/1_000_000:.2f} M".replace(".", ","), x=.5, y=.5, font=dict(color="white",size=12), showarrow=False)])
-                    st.plotly_chart(estilo_dashboard(fig_share, 218), use_container_width=True, config={"displayModeBar": False}, key="dashboard_share_donut")
+                    exibir_grafico_padronizado(estilo_dashboard(fig_share, 218), use_container_width=True, config={"displayModeBar": False}, key="dashboard_share_donut")
                 with cs2:
                     _linhas = "".join(
                         f'<tr><td><span class="dot" style="background:{CORES_SHARE[k % len(CORES_SHARE)]}"></span>{html.escape(str(nome))}</td>'
@@ -1849,7 +1904,7 @@ if aba_ativa == ABA_VENDEDOR:
                 if _tv:
                     fig_evolucao.update_yaxes(tickmode="array", tickvals=_tv, ticktext=_tt, range=[0, _tv[-1]])
                 fig_evolucao.update_xaxes(tickangle=0, nticks=12)
-                st.plotly_chart(estilo_dashboard(fig_evolucao, 224), use_container_width=True, config={"displayModeBar": False}, key="dashboard_evolucao_faturamento")
+                exibir_grafico_padronizado(estilo_dashboard(fig_evolucao, 224), use_container_width=True, config={"displayModeBar": False}, key="dashboard_evolucao_faturamento")
             else:
                 st.info("Não existem datas válidas no período selecionado.")
 
@@ -1867,7 +1922,7 @@ if aba_ativa == ABA_VENDEDOR:
                     fig_seg.update_traces(texttemplate="%{text}", textposition="outside", cliponaxis=False, marker_line_width=0)
                     fig_seg.update_layout(showlegend=False, xaxis_title="", yaxis_title="", margin=dict(l=0,r=32,t=2,b=4))
                     fig_seg.update_xaxes(showticklabels=False, showgrid=False, zeroline=False, range=[0, max(seg_dash["_valor"].max(), 1) * 1.9])
-                    st.plotly_chart(estilo_dashboard(fig_seg, 222), use_container_width=True, config={"displayModeBar": False}, key="dashboard_composicao_segmento")
+                    exibir_grafico_padronizado(estilo_dashboard(fig_seg, 222), use_container_width=True, config={"displayModeBar": False}, key="dashboard_composicao_segmento")
                 else:
                     st.info("Não há segmentos na seleção atual.")
             else:
@@ -1892,12 +1947,12 @@ if aba_ativa == ABA_VENDEDOR:
                     fig = px.bar(resumo_v, x="_valor", y="_vendedor", orientation="h", title="Faturamento por vendedor", text_auto=".2s")
                     fig.update_layout(yaxis={"categoryorder": "total ascending"}, xaxis_title="Valor (R$)", yaxis_title="")
                     fig.update_xaxes(tickprefix="R$ ", tickformat=",.0f")
-                    st.plotly_chart(formatar_eixos(fig), use_container_width=True, key="grafico_unico_01")
+                    exibir_grafico_padronizado(formatar_eixos(fig), use_container_width=True, key="grafico_unico_01")
                 with c2:
                     resumo_q = base.groupby("_vendedor", as_index=False)["_quantidade"].sum().sort_values("_quantidade", ascending=False)
                     fig = px.bar(resumo_q, x="_quantidade", y="_vendedor", orientation="h", title="Quantidade por vendedor", text_auto=True)
                     fig.update_layout(yaxis={"categoryorder": "total ascending"}, xaxis_title="Quantidade", yaxis_title="")
-                    st.plotly_chart(formatar_eixos(fig), use_container_width=True, key="grafico_unico_02")
+                    exibir_grafico_padronizado(formatar_eixos(fig), use_container_width=True, key="grafico_unico_02")
 
                 granularidade = radio_persistente("Detalhamento temporal", ["Dia", "Mês", "Trimestre"], "tempo_vendedor")
                 c1, c2 = st.columns(2)
@@ -1948,7 +2003,7 @@ if aba_ativa == ABA_VENDEDOR:
                     fig.update_xaxes(tickprefix="R$ ", tickformat=",.0f")
                     fig = formatar_eixos(fig)
                     fig.update_layout(hovermode="closest")  # necessário para o clique identificar a barra correta
-                    evento_grafico = st.plotly_chart(
+                    evento_grafico = exibir_grafico_padronizado(
                         fig, use_container_width=True, key="grafico_unico_03",
                         on_select="rerun", selection_mode="points",
                     )
@@ -2048,7 +2103,7 @@ if aba_ativa == ABA_CLIENTE:
                         xaxis_title="Valor (R$)", yaxis_title=""
                     )
                     fig.update_xaxes(tickprefix="R$ ", tickformat=",.0f")
-                    st.plotly_chart(formatar_eixos(fig), use_container_width=True, key="grafico_unico_04")
+                    exibir_grafico_padronizado(formatar_eixos(fig), use_container_width=True, key="grafico_unico_04")
 
             with c2:
                 resumo_qc = (
@@ -2067,7 +2122,7 @@ if aba_ativa == ABA_CLIENTE:
                         yaxis={"categoryorder": "total ascending"},
                         xaxis_title="Quantidade", yaxis_title=""
                     )
-                    st.plotly_chart(formatar_eixos(fig), use_container_width=True, key="grafico_unico_05")
+                    exibir_grafico_padronizado(formatar_eixos(fig), use_container_width=True, key="grafico_unico_05")
 
             # Share do cliente no faturamento total de cada vendedor.
             st.subheader("Share do cliente gerencial no faturamento do vendedor")
@@ -2096,7 +2151,7 @@ if aba_ativa == ABA_CLIENTE:
                 )
                 fig.update_layout(xaxis_title="Participação (%)", yaxis_title="")
                 fig.update_xaxes(ticksuffix="%")
-                st.plotly_chart(formatar_eixos(fig), use_container_width=True, key="grafico_unico_06")
+                exibir_grafico_padronizado(formatar_eixos(fig), use_container_width=True, key="grafico_unico_06")
                 st.dataframe(
                     share_cliente.rename(columns={
                         "_vendedor": "Vendedor",
@@ -2173,7 +2228,7 @@ if aba_ativa == ABA_CLIENTE:
                         fig.update_xaxes(tickprefix="R$ ", tickformat=",.0f")
                         fig = formatar_eixos(fig)
                         fig.update_layout(hovermode="closest")  # necessário para o clique identificar a barra correta
-                        evento_prod = st.plotly_chart(
+                        evento_prod = exibir_grafico_padronizado(
                             fig, use_container_width=True, key="grafico_unico_07",
                             on_select="rerun", selection_mode="points",
                         )
@@ -2296,7 +2351,7 @@ if aba_ativa == ABA_ITENS:
                 )
                 if metrica == "Faturamento":
                     fig.update_xaxes(tickprefix="R$ ", tickformat=",.0f")
-                st.plotly_chart(formatar_eixos(fig), use_container_width=True, key="grafico_unico_08")
+                exibir_grafico_padronizado(formatar_eixos(fig), use_container_width=True, key="grafico_unico_08")
                 st.caption(legenda_comparativo(rot_ant_r, rot_atu_r, "cada produto do ranking (faturamento)"))
 
                 # Evolução trimestral dos produtos
@@ -2347,7 +2402,7 @@ if aba_ativa == ABA_ITENS:
                         )
                         if metrica == "Faturamento":
                             fig.update_yaxes(tickprefix="R$ ", tickformat=",.0f")
-                        st.plotly_chart(formatar_eixos(fig), use_container_width=True, key="grafico_unico_09")
+                        exibir_grafico_padronizado(formatar_eixos(fig), use_container_width=True, key="grafico_unico_09")
 
                 # Tabela de produtos
                 st.subheader("Tabela de produtos")
@@ -2474,7 +2529,7 @@ if aba_ativa == ABA_PRECO:
                 fig.update_yaxes(tickprefix="R$ ", tickformat=",.2f")
                 fig = formatar_eixos(fig)
                 fig.update_layout(hovermode="closest")  # um pop-up por ponto, com a lista de clientes
-                st.plotly_chart(fig, use_container_width=True, key="grafico_preco_medio")
+                exibir_grafico_padronizado(fig, use_container_width=True, key="grafico_preco_medio")
                 st.caption(
                     "Passe o mouse sobre um ponto para ver os clientes que compraram naquele mês a preço igual "
                     "ou abaixo da média do produto. O preço de cada cliente é o preço médio dele no mês."
@@ -2577,3 +2632,125 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+
+
+# Camada final de padronização visual: mantém a mesma paleta, tipografia,
+# bordas, raios e estados de interação em todas as seções do painel.
+st.markdown("""
+<style>
+:root {
+  --ui-red: #ed1c24;
+  --ui-red-hover: #ff343c;
+  --ui-bg: #050607;
+  --ui-surface: #0b0e10;
+  --ui-surface-hover: #14181b;
+  --ui-border: rgba(160, 170, 180, .22);
+  --ui-text: #f4f6f8;
+  --ui-muted: #aab2ba;
+  --ui-radius: 10px;
+}
+html, body, .stApp, [data-testid="stAppViewContainer"],
+[data-testid="stSidebar"], button, input, textarea, select,
+[data-baseweb], [data-testid="stMarkdownContainer"] {
+  font-family: 'Inter', sans-serif !important;
+}
+[data-testid="stSidebar"] {
+  width: 280px !important;
+  min-width: 280px !important;
+  max-width: 280px !important;
+  background: linear-gradient(180deg, #0c0f11 0%, #070809 72%, #050607 100%) !important;
+  border-right: 1px solid var(--ui-border) !important;
+}
+/* Campos de entrada */
+[data-baseweb="input"] > div,
+[data-baseweb="select"] > div,
+[data-baseweb="textarea"] > div,
+[data-testid="stDateInput"] [data-baseweb="input"] > div,
+[data-testid="stNumberInput"] [data-baseweb="input"] > div {
+  background: var(--ui-surface) !important;
+  border: 1px solid var(--ui-border) !important;
+  border-radius: var(--ui-radius) !important;
+  color: var(--ui-text) !important;
+  box-shadow: none !important;
+}
+[data-baseweb="input"] input,
+[data-baseweb="textarea"] textarea,
+[data-baseweb="select"] *,
+[data-testid="stDateInput"] input,
+[data-testid="stNumberInput"] input {
+  color: var(--ui-text) !important;
+  font-family: 'Inter', sans-serif !important;
+}
+[data-baseweb="input"] > div:focus-within,
+[data-baseweb="select"] > div:focus-within,
+[data-baseweb="textarea"] > div:focus-within {
+  border-color: var(--ui-red) !important;
+  box-shadow: 0 0 0 1px var(--ui-red) !important;
+}
+/* Botões: mesmo formato e comportamento; vermelho para a ação principal */
+.stApp [data-testid="stButton"] button,
+.stApp [data-testid="stDownloadButton"] button,
+.stApp [data-testid="stFormSubmitButton"] button {
+  border-radius: var(--ui-radius) !important;
+  font-family: 'Inter', sans-serif !important;
+  font-weight: 600 !important;
+  transition: border-color .15s ease, background .15s ease, color .15s ease !important;
+}
+.stApp [data-testid="stButton"] button[kind="primary"],
+.stApp [data-testid="stFormSubmitButton"] button,
+.stApp [data-testid="stDownloadButton"] button {
+  background: linear-gradient(135deg, var(--ui-red-hover), #be0c15) !important;
+  color: #fff !important;
+  border: 1px solid var(--ui-red) !important;
+}
+.stApp [data-testid="stButton"] button[kind="primary"]:hover,
+.stApp [data-testid="stFormSubmitButton"] button:hover,
+.stApp [data-testid="stDownloadButton"] button:hover {
+  background: var(--ui-red) !important;
+  border-color: var(--ui-red-hover) !important;
+}
+.stApp [data-testid="stButton"] button[kind="secondary"] {
+  background: var(--ui-surface) !important;
+  color: var(--ui-text) !important;
+  border: 1px solid var(--ui-border) !important;
+}
+.stApp [data-testid="stButton"] button[kind="secondary"]:hover {
+  background: var(--ui-surface-hover) !important;
+  border-color: var(--ui-red) !important;
+  color: #fff !important;
+}
+/* Cartões, métricas, tabelas e áreas de dados */
+[data-testid="stMetric"], [data-testid="stDataFrame"],
+[data-testid="stTable"], [data-testid="stFileUploader"] section,
+[data-testid="stAlert"] {
+  border-radius: var(--ui-radius) !important;
+}
+[data-testid="stDataFrame"], [data-testid="stTable"] {
+  border: 1px solid var(--ui-border) !important;
+  overflow: hidden !important;
+}
+[data-testid="stFileUploader"] section {
+  background: var(--ui-surface) !important;
+  border: 1px dashed var(--ui-border) !important;
+}
+[data-testid="stFileUploader"] section:hover {
+  border-color: var(--ui-red) !important;
+}
+/* Checkbox e seleções */
+[data-testid="stCheckbox"] label, [data-testid="stRadio"] label {
+  color: var(--ui-text) !important;
+}
+[data-testid="stCheckbox"] input:checked + div,
+[data-baseweb="checkbox"] input:checked ~ div {
+  background-color: var(--ui-red) !important;
+  border-color: var(--ui-red) !important;
+}
+/* Consistência de títulos, divisórias e textos auxiliares */
+h1, h2, h3, h4 { color: #fff !important; font-family: 'Inter', sans-serif !important; }
+hr { border-color: var(--ui-border) !important; }
+[data-testid="stCaptionContainer"], .intech-footer-muted { color: var(--ui-muted) !important; }
+/* Mantém o menu lateral sempre aberto e sem controle de recolher */
+[data-testid="stSidebarCollapseButton"], [data-testid="stSidebarHeader"] button,
+button[kind="header"] { display: none !important; pointer-events: none !important; }
+</style>
+""", unsafe_allow_html=True)
