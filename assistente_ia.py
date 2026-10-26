@@ -63,7 +63,7 @@ LIMITE_MAXIMO = 200          # máximo de linhas por consulta
 MAX_LINHAS_TOTAIS = 300      # máximo de linhas somando todas as consultas
 
 MAX_VALORES_LISTADOS = 40    # valores listados no esquema para dimensões pequenas
-MIN_REGISTROS_GRUPO_PRIVACIDADE = 5  # grupos menores não são enviados ao Gemini
+MIN_REGISTROS_GRUPO_PRIVACIDADE = 0  # grupos menores não são enviados ao Gemini
 
 TURNOS_HISTORICO = 4         # turnos anteriores enviados ao planejador
 
@@ -1691,6 +1691,69 @@ def _todos_resultados_vazios(resultados):
     return bool(validos) and all(_total_registros_seguro(r) == 0 for r in validos)
 
 
+def _termo_pesquisa_nome_nao_encontrado(pergunta, quadro):
+    """Detecta nome explicitamente pesquisado entre aspas que não existe na base.
+
+    Faz a validação localmente antes de enviar a pergunta ao Gemini, evitando que um
+    nome não reconhecido seja enviado sem anonimização ou que uma consulta ampla seja
+    confundida com uma pesquisa válida pelo nome.
+    """
+    texto = str(pergunta or "")
+    p = normalizar(texto)
+    if not any(t in p for t in ("pesquisa por", "pesquisar por", "busca por", "buscar por", "procura por", "procurar por")):
+        return None
+
+    # Exige aspas para não confundir palavras comuns da pergunta com nomes próprios.
+    m = re.search(r'["“”\']([^"“”\']{2,100})["“”\']', texto)
+    if not m:
+        return None
+    termo = m.group(1).strip()
+    nomes_por_prefixo = nomes_para_anonimizar(quadro)
+    alvo = normalizar(termo)
+    if not alvo:
+        return None
+    # Se o termo existir como qualquer dimensão pseudonimizada (por exemplo,
+    # produto/código ou vendedor), não o trate automaticamente como cliente ausente.
+    if any(normalizar(nome) == alvo for nomes in nomes_por_prefixo.values() for nome in nomes):
+        return None
+    for dim in ("produto", "sku"):
+        coluna = quadro.cols.get(dim)
+        if coluna and coluna in quadro._df.columns:
+            if any(normalizar(v) == alvo for v in quadro._df[coluna].dropna().astype(str).unique()):
+                return None
+    return termo
+
+
+def _consulta_rapida_sem_filtros(pergunta, quadro):
+    """Reconhece apenas perguntas globais inequívocas; não usa base estática nem histórico."""
+    p = normalizar(pergunta)
+    # Se houver pedido de segmentação, período ou identificador, usar o planejador completo.
+    termos_que_exigem_planejamento = (
+        " por ", " por mes", " por ano", " em ", " no mes", " no ano", " trimestre",
+        " cliente", " produto", " sku", " vendedor", " representante", " empresa",
+        " segmento", " departamento", " pedido", " ultima compra", " ultima data",
+        " entre ", " desde ", " ate ", " de ", " para ", " compar", " maior", " menor",
+    )
+    if any(t in f" {p} " for t in termos_que_exigem_planejamento):
+        return None
+
+    menciona_faturamento = any(t in p for t in ("faturamento", "valor vendido", "vendas totais", "total de vendas", "total vendido", "vendeu em dinheiro"))
+    menciona_quantidade = any(t in p for t in ("quantidade", "unidades vendidas", "total de unidades", "quantas unidades", "total em unidades"))
+    if menciona_faturamento == menciona_quantidade:  # nenhuma ou ambígua
+        return None
+
+    metricas = ["faturamento"] if menciona_faturamento else ["quantidade"]
+    if menciona_quantidade and not quadro.tem_quantidade:
+        return None
+    consulta = {
+        "descricao": "Total geral calculado localmente pela rota rápida",
+        "agrupar_por": [], "metricas": metricas, "filtros": [],
+        "periodo": None, "somente_ultima_data": False,
+        "ordenar_por": "faturamento", "direcao": "desc", "limite": 1,
+    }
+    return consulta
+
+
 def processar_pergunta(df, cols, pergunta, mapa, historico, gerar, etapa=None):
 
     """Planeja -> executa localmente -> responde.
@@ -1707,17 +1770,41 @@ def processar_pergunta(df, cols, pergunta, mapa, historico, gerar, etapa=None):
 
     quadro = Quadro(df, cols)
 
+    # Se o usuário pesquisou explicitamente um nome entre aspas e ele não existe
+    # exatamente na dimensão de clientes, interromper antes de chamar o Gemini.
+    # A interface reconhece plano vazio/resultado inválido e limpa memória e pseudônimos.
+    nome_nao_encontrado = _termo_pesquisa_nome_nao_encontrado(pergunta, quadro)
+    if nome_nao_encontrado is not None:
+        return {
+            "resposta": "nao foram encontrados registros",
+            "resposta_segura": "nao foram encontrados registros",
+            "detalhes": {"rota": "validacao_local", "plano": [], "avisos": [], "resultados": []},
+            "memoria": None,
+        }
+
     pergunta_segura, _encontrados = anonimizar_pergunta(pergunta, nomes_para_anonimizar(quadro), mapa)
 
     esquema = montar_esquema(quadro)
 
-    # Requisição 1: a IA decide quais dados precisa.
-
-    aviso_etapa("Entendendo a pergunta...")
-
-    texto_plano = gerar(montar_prompt_planejador(pergunta_segura, esquema, historico), INSTRUCOES_PLANEJADOR, True)
-
-    consultas, avisos, esclarecimento = validar_plano(_extrair_json(texto_plano), cols, quadro.tem_data)
+    # Rota rápida: perguntas inequívocas de total geral são calculadas localmente.
+    # A IA continua sendo consultada para redigir a resposta, mas economizamos a chamada
+    # de planejamento. Não há base estática, cache de resultados nem reutilização de histórico.
+    consulta_rapida = _consulta_rapida_sem_filtros(pergunta, quadro)
+    if consulta_rapida is not None:
+        aviso_etapa("Calculando diretamente os dados...")
+        consultas = [consulta_rapida]
+        avisos = []
+        esclarecimento = None
+        detalhes = {
+            "rota": "rapida_local", "pergunta_enviada": pergunta_segura,
+            "plano": consultas, "avisos": avisos,
+        }
+    else:
+        # Rota completa: a IA planeja a consulta com base na pergunta atual.
+        aviso_etapa("Entendendo a pergunta...")
+        texto_plano = gerar(montar_prompt_planejador(pergunta_segura, esquema, historico), INSTRUCOES_PLANEJADOR, True)
+        consultas, avisos, esclarecimento = validar_plano(_extrair_json(texto_plano), cols, quadro.tem_data)
+        detalhes = {"rota": "planejamento_ia", "pergunta_enviada": pergunta_segura, "plano": consultas, "avisos": avisos}
 
     detalhes = {"pergunta_enviada": pergunta_segura, "plano": consultas, "avisos": avisos}
 
