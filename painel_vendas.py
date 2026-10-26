@@ -1154,8 +1154,8 @@ def preparar_base(chave, _conteudo, nome, aba):
     df["_segmento"] = texto(col["segmento"])
     df["_regiao"] = texto(col.get("regiao") or col.get("gerente_regiao"))
 
-    # Data de referência por registro:
-    # prioriza Data Faturamento; se estiver nula/vazia/inválida, usa Data Pedido.
+    # Mantém as datas originais separadas. Nunca preenche _data_faturamento com Ano/Mês,
+    # pois isso faria uma linha sem data de faturamento parecer faturada.
     if col["data_faturamento"]:
         data_faturamento = pd.to_datetime(
             df[col["data_faturamento"]], errors="coerce", dayfirst=True
@@ -1172,19 +1172,21 @@ def preparar_base(chave, _conteudo, nome, aba):
 
     df["_data_faturamento"] = data_faturamento
     df["_data_pedido"] = data_pedido
-    df["_data"] = data_faturamento.fillna(data_pedido)
-    data_padrao = "Data Faturamento (usa Data Pedido quando nula)"
 
-    # Se ambas as datas estiverem ausentes, tenta Ano Fat. e Mês Fat. como último recurso.
-    if df["_data"].isna().any() and col["ano"] and col["mes"]:
+    data_ano_mes = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns]")
+    if col["ano"] and col["mes"]:
         ano = pd.to_numeric(df[col["ano"]], errors="coerce")
         mes = pd.to_numeric(df[col["mes"]], errors="coerce")
-        data_ano_mes = pd.to_datetime(
-            ano.astype("Int64").astype(str) + "-" + mes.astype("Int64").astype(str) + "-01",
-            errors="coerce",
-        )
-        df["_data"] = df["_data"].fillna(data_ano_mes)
-        df["_data_faturamento"] = df["_data_faturamento"].fillna(data_ano_mes)
+        validos = ano.notna() & mes.between(1, 12)
+        if validos.any():
+            data_ano_mes.loc[validos] = pd.to_datetime(
+                ano.loc[validos].astype(int).astype(str) + "-"
+                + mes.loc[validos].astype(int).astype(str).str.zfill(2) + "-01",
+                errors="coerce",
+            )
+    df["_data_ano_mes"] = data_ano_mes
+    df["_data"] = data_faturamento.combine_first(data_pedido).combine_first(data_ano_mes)
+    data_padrao = "Data Faturamento; Data Pedido quando a data de faturamento estiver vazia"
 
     return df, col, col_valor, col_vendedor, col_cliente, col_produto, data_padrao
 
@@ -1213,33 +1215,24 @@ if not col_cliente:
 if not col_produto:
     st.warning("Não encontrei Produto nem SKU.")
 
-# Fonte de data escolhida pelo usuário; no modo faturamento, Data Pedido é usada como fallback.
-# Se a base não tem nenhuma Data Faturamento válida (coluna ausente ou toda vazia),
-# a Data Pedido é selecionada automaticamente e a escolha fica travada.
-sem_data_faturamento = not df["_data_faturamento"].notna().any()
-if sem_data_faturamento and df["_data_pedido"].notna().any():
-    st.session_state["fonte_data_referencia"] = "Data Pedido"
-    data_padrao = "Data Pedido (a base não possui Data Faturamento)"
-else:
-    sem_data_faturamento = False
+# Data automática por registro: cada linha usa Data Faturamento quando preenchida;
+# se estiver vazia ou inválida, usa Data Pedido. Ano/Mês é o último recurso.
+# Não há seletor manual porque a regra deve ser aplicada linha a linha na base inteira.
+df["_data"] = (
+    df["_data_faturamento"]
+    .combine_first(df["_data_pedido"])
+    .combine_first(df["_data_ano_mes"])
+)
+data_padrao = "Data Faturamento; Data Pedido quando a data de faturamento estiver vazia"
 
 with st.sidebar:
     st.caption("Data utilizada nos filtros e análises")
-    fonte_data = st.radio(
-        "Data de referência",
-        ["Data Faturamento", "Data Pedido"],
-        index=0,
-        key="fonte_data_referencia",
-        label_visibility="collapsed",
-        disabled=sem_data_faturamento,
+    st.markdown(
+        "<div style=\"padding:9px 11px;border:1px solid #30373d;border-radius:9px;background:#0e1214;color:#f5f7f8;font-size:0.84rem;\">"
+        "Automática por pedido: usa <b>Data Faturamento</b> quando existe; caso contrário, usa <b>Data Pedido</b>."
+        "</div>",
+        unsafe_allow_html=True,
     )
-    if sem_data_faturamento:
-        st.caption("Sem Data Faturamento na base: usando Data Pedido automaticamente.")
-
-if fonte_data == "Data Pedido":
-    df["_data"] = df["_data_pedido"].fillna(df["_data_faturamento"])
-else:
-    df["_data"] = df["_data_faturamento"].fillna(df["_data_pedido"])
 
 # Filtros globais
 # Os filtros (exceto o período) são guardados para reaplicar no período anterior dos KPIs.
@@ -1401,36 +1394,54 @@ def _metricas(base):
 
 
 def comparativo_kpis():
+    """Compara o trimestre de referência com o mesmo intervalo do ano anterior.
+
+    O trimestre é determinado pela data final selecionada no filtro global. A comparação
+    vai do primeiro dia desse trimestre até a data final selecionada, contra as mesmas
+    datas do ano anterior. Os demais filtros (empresa, vendedor etc.) são reaplicados.
+    Não existe fallback para comparação entre metades.
+    """
     if periodo_atual is None:
         return None
-    ini, fim = periodo_atual
-    um_seg = pd.Timedelta(seconds=1)
-    duracao = fim - ini + um_seg
-    ant_fim = ini - um_seg
-    ant_ini = ant_fim - duracao + um_seg
-    base_ant = df[df["_data"].between(ant_ini, ant_fim, inclusive="both")]
+
+    _, fim_selecionado = periodo_atual
+    if pd.isna(fim_selecionado):
+        return None
+
+    fim_ref = pd.Timestamp(fim_selecionado)
+    # Início do trimestre referente à data final selecionada (jan/abr/jul/out).
+    mes_inicio_trimestre = ((fim_ref.month - 1) // 3) * 3 + 1
+    inicio_trimestre = pd.Timestamp(year=fim_ref.year, month=mes_inicio_trimestre, day=1)
+
+    # Mesmo período do ano anterior; DateOffset trata corretamente anos bissextos.
+    inicio_ant = inicio_trimestre - pd.DateOffset(years=1)
+    fim_ant = fim_ref - pd.DateOffset(years=1)
+
+    base_atual = df[df["_data"].between(inicio_trimestre, fim_ref, inclusive="both")].copy()
+    base_anterior = df[df["_data"].between(inicio_ant, fim_ant, inclusive="both")].copy()
     for aplicar in filtros_aplicados:
-        base_ant = aplicar(base_ant)
-    if not base_ant.empty:
+        base_atual = aplicar(base_atual)
+        base_anterior = aplicar(base_anterior)
+
+    if base_atual.empty or base_anterior.empty:
         return {
-            "legenda": "vs. período anterior",
-            "rotulo": f"{ant_ini:%d/%m/%Y} a {ant_fim:%d/%m/%Y}",
-            "atual": _metricas(filtrado),
-            "anterior": _metricas(base_ant),
+            "legenda": "trimestre atual vs. mesmo período do ano anterior",
+            "rotulo": (
+                f"Atual: {inicio_trimestre:%d/%m/%Y} a {fim_ref:%d/%m/%Y} | "
+                f"Ano anterior: {inicio_ant:%d/%m/%Y} a {fim_ant:%d/%m/%Y}"
+            ),
+            "atual": _metricas(base_atual),
+            "anterior": _metricas(base_anterior) if not base_anterior.empty else {},
         }
-    # Alternativa: metades do próprio período filtrado.
-    base_dt = filtrado[filtrado["_data"].notna()]
-    if base_dt.empty or duracao < pd.Timedelta(days=2):
-        return None
-    meio = ini + duracao / 2
-    h1, h2 = base_dt[base_dt["_data"] < meio], base_dt[base_dt["_data"] >= meio]
-    if h1.empty or h2.empty:
-        return None
+
     return {
-        "legenda": "2ª metade vs. 1ª metade",
-        "rotulo": f"{ini:%d/%m/%Y} a {(meio - um_seg):%d/%m/%Y} (1ª) x {meio:%d/%m/%Y} a {fim:%d/%m/%Y} (2ª). Não há dados antes do período filtrado",
-        "atual": _metricas(h2),
-        "anterior": _metricas(h1),
+        "legenda": "trimestre atual vs. mesmo período do ano anterior",
+        "rotulo": (
+            f"Atual: {inicio_trimestre:%d/%m/%Y} a {fim_ref:%d/%m/%Y} | "
+            f"Ano anterior: {inicio_ant:%d/%m/%Y} a {fim_ant:%d/%m/%Y}"
+        ),
+        "atual": _metricas(base_atual),
+        "anterior": _metricas(base_anterior) if not base_anterior.empty else {},
     }
 
 
