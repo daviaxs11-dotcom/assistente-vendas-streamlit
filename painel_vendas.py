@@ -5,6 +5,7 @@
 
 import base64
 import html
+import hashlib
 import io
 import re
 import unicodedata
@@ -18,8 +19,196 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from engine_projecao import projetar_meses
+from engine_projecao import projetar_meses_com_estoque
 
 from assistente_ia import exibir_assistente_ia
+
+
+@st.cache_data(show_spinner="Calculando projeção pela primeira vez...", max_entries=64)
+def projetar_meses_em_cache(chave_dados, _df, horizonte, simulacoes, coluna_data, coluna_valor, data_referencia, versao_engine):
+    """Armazena o resultado caro da projeção; _df não é re-hasheado pelo Streamlit."""
+    _ = versao_engine  # força invalidação do cache quando a lógica do motor mudar
+    return projetar_meses(
+        _df,
+        horizonte=int(horizonte),
+        simulacoes=int(simulacoes),
+        coluna_data=coluna_data,
+        coluna_valor=coluna_valor,
+        hoje=data_referencia,
+    )
+
+
+@st.cache_data(show_spinner="Calculando projeção por SKU com estoque (só na primeira vez)...", max_entries=16)
+def projetar_com_estoque_em_cache(chave, _df, _estoque, horizonte, simulacoes,
+                                  coluna_data, coluna_valor, coluna_sku, data_referencia):
+    """Cacheia a projeção por SKU + estoque; _df e _estoque não são re-hasheados (a chave os identifica)."""
+    return projetar_meses_com_estoque(
+        _df, _estoque,
+        horizonte=int(horizonte), simulacoes=int(simulacoes),
+        coluna_data=coluna_data, coluna_valor=coluna_valor, coluna_sku=coluna_sku,
+        coluna_estoque_sku="SKU", coluna_estoque_quantidade="Quantidade", coluna_estoque_data="Data",
+        hoje=data_referencia,
+    )
+
+
+def assinatura_dados_projecao(df, coluna_valor):
+    """Assinatura determinística apenas das colunas que afetam a projeção."""
+    candidatas = ["_data", coluna_valor, "_sku", "sku", "_produto", "produto"]
+    colunas = list(dict.fromkeys(c for c in candidatas if c in df.columns))
+    base = df.loc[:, colunas]
+    digest = hashlib.sha256()
+    digest.update(str(base.shape).encode("utf-8"))
+    digest.update("|".join(map(str, base.dtypes)).encode("utf-8"))
+    # O hash considera os valores e o índice; muda automaticamente se os dados mudarem.
+    digest.update(pd.util.hash_pandas_object(base, index=True).values.tobytes())
+    return digest.hexdigest()
+
+
+
+
+def aplicar_estoque_na_projecao(
+    resultado,
+    base_vendas,
+    estoque,
+    coluna_sku_vendas,
+    coluna_valor_proj,
+    horizonte,
+    hoje=None,
+):
+    """
+    Ajusta os caminhos probabilísticos da previsão usando o estoque como restrição
+    de disponibilidade. A demanda simulada é distribuída entre SKUs pela participação
+    histórica; a venda realizada simulada é limitada ao estoque remanescente.
+    Como o relatório não contém reposições futuras, assume-se reposição zero.
+    """
+    if not isinstance(resultado, dict) or not resultado.get("ok"):
+        return resultado, {"aplicado": False, "motivo": "A projeção base não foi calculada."}
+    if not isinstance(estoque, pd.DataFrame) or estoque.empty:
+        return resultado, {"aplicado": False, "motivo": "Nenhum histórico de estoque foi carregado."}
+    if not coluna_sku_vendas or coluna_sku_vendas not in base_vendas.columns:
+        return resultado, {"aplicado": False, "motivo": "A base de vendas não tem uma coluna SKU compatível."}
+    if "_data" not in base_vendas or coluna_valor_proj not in base_vendas:
+        return resultado, {"aplicado": False, "motivo": "Faltam data ou métrica na base de vendas."}
+
+    caminhos = resultado.get("_caminhos_simulados")
+    if caminhos is None:
+        return resultado, {"aplicado": False, "motivo": "A engine não disponibilizou os caminhos das simulações."}
+    caminhos = np.asarray(caminhos, dtype=float)
+    if caminhos.ndim != 2 or caminhos.shape[1] < int(horizonte):
+        return resultado, {"aplicado": False, "motivo": "Formato das simulações incompatível com o horizonte."}
+
+    vendas = base_vendas[[coluna_sku_vendas, "_data", "_quantidade", "_valor", coluna_valor_proj]].copy()
+    vendas.columns = ["SKU", "Data", "Quantidade_vendida", "Valor_vendido", "Metrica"]
+    vendas["SKU"] = vendas["SKU"].astype("string").str.strip().str.replace(r"\.0$", "", regex=True)
+    vendas["Data"] = pd.to_datetime(vendas["Data"], errors="coerce", dayfirst=True)
+    for c in ("Quantidade_vendida", "Valor_vendido", "Metrica"):
+        vendas[c] = pd.to_numeric(vendas[c], errors="coerce")
+    vendas = vendas.dropna(subset=["SKU", "Data", "Quantidade_vendida", "Valor_vendido", "Metrica"])
+    vendas = vendas[vendas["SKU"].ne("") & vendas["SKU"].ne("<NA>")]
+    if vendas.empty:
+        return resultado, {"aplicado": False, "motivo": "Não há vendas válidas para cruzar com os SKUs do estoque."}
+
+    est = estoque[["SKU", "Quantidade", "Data"]].copy()
+    est["SKU"] = est["SKU"].astype("string").str.strip().str.replace(r"\.0$", "", regex=True)
+    est["Quantidade"] = pd.to_numeric(est["Quantidade"], errors="coerce")
+    est["Data"] = pd.to_datetime(est["Data"], errors="coerce", dayfirst=True)
+    est = est.dropna(subset=["SKU", "Quantidade", "Data"])
+    if est.empty:
+        return resultado, {"aplicado": False, "motivo": "O relatório de estoque não tem linhas válidas."}
+
+    # Usa o saldo mais recente de cada SKU, somando depósitos duplicados no mesmo dia
+    # antes de escolher a fotografia mais recente.
+    est_dia = est.groupby(["SKU", "Data"], as_index=False)["Quantidade"].sum()
+    estoque_atual = est_dia.sort_values("Data").groupby("SKU", as_index=False).tail(1)
+    estoque_atual = estoque_atual.set_index("SKU")["Quantidade"].clip(lower=0)
+
+    # A participação é calculada nos últimos 12 meses completos disponíveis.
+    data_ref = pd.Timestamp(hoje).normalize() if hoje is not None else pd.Timestamp.today().normalize()
+    inicio = (data_ref.to_period("M") - 12).start_time
+    vendas_rec = vendas[(vendas["Data"] >= inicio) & (vendas["Data"] < data_ref.to_period("M").start_time)]
+    if vendas_rec.empty:
+        vendas_rec = vendas
+    if coluna_valor_proj == "_quantidade":
+        pesos = vendas_rec.groupby("SKU")["Quantidade_vendida"].sum().clip(lower=0)
+        preco_por_sku = (
+            vendas_rec.groupby("SKU")["Valor_vendido"].sum()
+            / vendas_rec.groupby("SKU")["Quantidade_vendida"].sum().replace(0, np.nan)
+        ).replace([np.inf, -np.inf], np.nan).fillna(0).clip(lower=0)
+    else:
+        pesos = vendas_rec.groupby("SKU")["Valor_vendido"].sum().clip(lower=0)
+        preco_por_sku = (
+            vendas_rec.groupby("SKU")["Valor_vendido"].sum()
+            / vendas_rec.groupby("SKU")["Quantidade_vendida"].sum().replace(0, np.nan)
+        ).replace([np.inf, -np.inf], np.nan).fillna(0).clip(lower=0)
+
+    skus = sorted(set(vendas["SKU"].astype(str)) & set(estoque_atual.index.astype(str)) & set(pesos.index.astype(str)))
+    skus = [s for s in skus if float(pesos.get(s, 0) or 0) > 0]
+    if not skus:
+        return resultado, {"aplicado": False, "motivo": "Nenhum SKU tem vendas e saldo de estoque compatíveis."}
+
+    pesos_arr = np.array([float(pesos.get(s, 0)) for s in skus], dtype=float)
+    participacoes = pesos_arr / pesos_arr.sum()
+    saldos = np.array([max(0.0, float(estoque_atual.get(s, 0))) for s in skus], dtype=float)
+    precos = np.array([max(0.0, float(preco_por_sku.get(s, 0))) for s in skus], dtype=float)
+
+    caminhos_base = np.maximum(caminhos[:, :int(horizonte)], 0.0)
+    caminhos_ajustados = np.zeros_like(caminhos_base)
+    # Cada simulação começa com o saldo atual e consome o estoque ao longo dos meses.
+    for i in range(caminhos_base.shape[0]):
+        saldo = saldos.copy()
+        for t in range(caminhos_base.shape[1]):
+            demanda_total = caminhos_base[i, t]
+            demanda_alocada = demanda_total * participacoes
+            if coluna_valor_proj == "_quantidade":
+                venda_sku = np.minimum(demanda_alocada, saldo)
+                caminhos_ajustados[i, t] = venda_sku.sum()
+            else:
+                # A previsão é monetária; converte a demanda alocada em unidades por SKU,
+                # limita ao saldo e converte as unidades atendidas em valor usando preço médio histórico.
+                unidades_demandadas = np.divide(
+                    demanda_alocada, precos,
+                    out=np.zeros_like(demanda_alocada), where=precos > 0
+                )
+                unidades_atendidas = np.minimum(unidades_demandadas, saldo)
+                caminhos_ajustados[i, t] = float(np.sum(unidades_atendidas * precos))
+                venda_sku = unidades_atendidas
+            saldo = np.maximum(0.0, saldo - venda_sku)
+
+    resultado = dict(resultado)
+    resultado["_caminhos_simulados_sem_estoque"] = caminhos
+    resultado["_caminhos_simulados"] = caminhos_ajustados
+    previsoes = resultado["previsoes"].copy()
+    percentis = {p: np.quantile(caminhos_ajustados, p / 100.0, axis=0) for p in (5, 10, 50, 90, 95)}
+    colunas_percentis = {
+        50: "Previsão central (P50)",
+        10: "Limite inferior 80% (P10)",
+        90: "Limite superior 80% (P90)",
+        5: "Limite inferior 90% (P05)",
+        95: "Limite superior 90% (P95)",
+    }
+    for p, coluna in colunas_percentis.items():
+        if coluna in previsoes.columns:
+            previsoes.loc[:, coluna] = percentis[p]
+    resultado["previsoes"] = previsoes
+    resultado["modelo_rotulo"] = str(resultado.get("modelo_rotulo", "Modelo probabilístico")) + " + restrição probabilística de estoque"
+    resultado["observacao"] = (
+        str(resultado.get("observacao", "")).rstrip()
+        + " Os caminhos simulados foram ajustados pela disponibilidade de estoque por SKU: "
+        "a demanda simulada é distribuída pela participação histórica, limitada ao saldo mais recente "
+        "e o saldo é consumido mês a mês. Como o arquivo não informa reposições futuras, a simulação "
+        "assume ausência de reposição; as projeções com estoque são um cenário de capacidade de atendimento, "
+        "não uma previsão de demanda irrestrita."
+    )
+    data_mais_recente = est["Data"].max()
+    dias_desde = max(0, int((data_ref - data_mais_recente.normalize()).days))
+    return resultado, {
+        "aplicado": True,
+        "skus_modelados": len(skus),
+        "estoque_inicial_unidades": float(saldos.sum()),
+        "data_estoque_mais_recente": data_mais_recente,
+        "dias_desde_ultimo_registro": dias_desde,
+        "participacoes_sku": len(skus),
+    }
 
 
 st.set_page_config(page_title="Intech Machine | Painel Interativo de Vendas", page_icon="📊", layout="wide", initial_sidebar_state="expanded")
@@ -64,6 +253,121 @@ def converter_numero(serie):
         s.loc[mask_br].str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
     )
     return pd.to_numeric(s, errors="coerce").fillna(0)
+
+
+def ler_relatorio_estoque(arquivo=None, nome_forcado=None, conteudo_forcado=None):
+    """Lê e valida relatório de estoque com Código (SKU), Quantidade e Data."""
+    nome = str(nome_forcado if nome_forcado is not None else getattr(arquivo, "name", "")).lower()
+    conteudo = conteudo_forcado if conteudo_forcado is not None else arquivo.getvalue()
+    if nome.endswith((".xlsx", ".xlsm", ".xls")):
+        bruto = pd.read_excel(io.BytesIO(conteudo))
+    elif nome.endswith(".csv"):
+        try:
+            bruto = pd.read_csv(io.BytesIO(conteudo), sep=None, engine="python", encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            bruto = pd.read_csv(io.BytesIO(conteudo), sep=None, engine="python", encoding="latin-1")
+    else:
+        raise ValueError("Formato não suportado. Use Excel ou CSV.")
+
+    col_codigo = localizar_coluna(bruto, ["Código", "Codigo", "SKU"])
+    col_qtd = localizar_coluna(bruto, ["Quantidade", "Qtd", "Qtde", "Saldo"])
+    col_data = localizar_coluna(bruto, ["Data", "Data Estoque", "Data Referência", "Data Referencia"])
+    faltantes = [
+        rotulo for rotulo, coluna in
+        [("Código/SKU", col_codigo), ("Quantidade", col_qtd), ("Data", col_data)]
+        if coluna is None
+    ]
+    if faltantes:
+        raise ValueError("Colunas obrigatórias não encontradas: " + ", ".join(faltantes) +
+                         ". O arquivo deve conter Código, Quantidade e Data.")
+
+    estoque = bruto[[col_codigo, col_qtd, col_data]].copy()
+    estoque.columns = ["SKU", "Quantidade", "Data"]
+    estoque["SKU"] = estoque["SKU"].astype("string").str.strip()
+    estoque["SKU"] = estoque["SKU"].str.replace(r"\.0$", "", regex=True)
+    estoque["Quantidade"] = pd.to_numeric(estoque["Quantidade"], errors="coerce")
+    estoque["Data"] = pd.to_datetime(estoque["Data"], errors="coerce", dayfirst=True)
+    total_original = len(estoque)
+    estoque = estoque.dropna(subset=["SKU", "Quantidade", "Data"])
+    estoque = estoque[estoque["SKU"].str.len().gt(0)].copy()
+    estoque["SKU"] = estoque["SKU"].astype(str)
+    if estoque.empty:
+        raise ValueError("O relatório não possui linhas válidas após validar SKU, Quantidade e Data.")
+    estoque = estoque.sort_values("Data").reset_index(drop=True)
+    diagnostico = {
+        "linhas_originais": total_original,
+        "linhas_validas": len(estoque),
+        "linhas_descartadas": total_original - len(estoque),
+        "skus": int(estoque["SKU"].nunique()),
+        "datas": int(estoque["Data"].nunique()),
+        "duplicatas_sku_data": int(estoque.duplicated(["SKU", "Data"]).sum()),
+    }
+    return estoque, diagnostico
+
+
+@st.cache_data(show_spinner="Carregando histórico de estoque...", max_entries=6)
+def ler_relatorio_estoque_em_cache(conteudo, nome):
+    """Lê o relatório de estoque uma única vez por conteúdo e nome de arquivo."""
+    return ler_relatorio_estoque(nome_forcado=nome, conteudo_forcado=conteudo)
+
+
+def calcular_diagnostico_estoque_vendas(base_vendas, estoque, coluna_sku_vendas, coluna_data="_data"):
+    """Compara WAPE ingênuo geral e em meses com estoque positivo; diagnóstico, não modelo treinado."""
+    if not coluna_sku_vendas or coluna_sku_vendas not in base_vendas.columns:
+        return None, "A base de vendas não possui uma coluna SKU identificável para cruzamento."
+    if coluna_data not in base_vendas.columns or "_quantidade" not in base_vendas.columns:
+        return None, "Não foi possível identificar data e quantidade na base de vendas."
+
+    vendas = base_vendas[[coluna_sku_vendas, coluna_data, "_quantidade"]].copy()
+    vendas.columns = ["SKU", "Data", "Vendas"]
+    vendas["SKU"] = vendas["SKU"].astype("string").str.strip().str.replace(r"\.0$", "", regex=True)
+    vendas["Data"] = pd.to_datetime(vendas["Data"], errors="coerce")
+    vendas["Vendas"] = pd.to_numeric(vendas["Vendas"], errors="coerce")
+    vendas = vendas.dropna(subset=["SKU", "Data", "Vendas"])
+    vendas["SKU"] = vendas["SKU"].astype(str)
+    vendas["Mês"] = vendas["Data"].dt.to_period("M")
+    vendas_mes = vendas.groupby(["SKU", "Mês"], as_index=False)["Vendas"].sum()
+
+    # Para cada SKU/mês, considera a última fotografia de estoque disponível naquele mês.
+    est = estoque.copy()
+    est["SKU"] = est["SKU"].astype("string").str.strip().str.replace(r"\.0$", "", regex=True).astype(str)
+    est["Mês"] = est["Data"].dt.to_period("M")
+    # Soma depósitos do mesmo SKU/dia e usa a última fotografia do mês.
+    est = est.groupby(["SKU", "Data", "Mês"], as_index=False)["Quantidade"].sum()
+    est = est.sort_values("Data").groupby(["SKU", "Mês"], as_index=False).tail(1)
+    est = est[["SKU", "Mês", "Quantidade"]]
+    cruzado = vendas_mes.merge(est, on=["SKU", "Mês"], how="inner")
+    cruzado = cruzado.sort_values(["SKU", "Mês"])
+    # Previsão ingênua = venda do MÊS CALENDÁRIO anterior (não da linha anterior após o merge).
+    anterior = vendas_mes.copy()
+    anterior["Mês"] = anterior["Mês"] + 1
+    anterior = anterior.rename(columns={"Vendas": "Previsão ingênua"})
+    cruzado = cruzado.merge(anterior, on=["SKU", "Mês"], how="left")
+    aval = cruzado.dropna(subset=["Previsão ingênua"]).copy()
+    if aval.empty:
+        return cruzado, "Ainda não há meses consecutivos suficientes para calcular o WAPE diagnóstico."
+
+    aval["Erro absoluto"] = (aval["Vendas"] - aval["Previsão ingênua"]).abs()
+    def wape(parte):
+        denominador = parte["Vendas"].abs().sum()
+        return float(parte["Erro absoluto"].sum() / denominador * 100) if denominador > 0 else float("nan")
+
+    positivos = aval[aval["Quantidade"] > 0]
+    zerados = aval[aval["Quantidade"] <= 0]
+    resumo = {
+        "WAPE ingênuo — todos os meses com estoque registrado (%)": wape(aval),
+        "WAPE ingênuo — meses com estoque positivo (%)": wape(positivos),
+        "Meses-SKU avaliados": len(aval),
+        "Meses-SKU com estoque positivo": len(positivos),
+        "Meses-SKU com estoque zero/negativo": len(zerados),
+        "Cobertura SKU-mês do relatório (%)": float(len(cruzado) / max(len(vendas_mes), 1) * 100),
+    }
+    if len(zerados) == 0:
+        resumo["Aviso"] = (
+            "Nenhum mês com estoque zero/negativo na amostra: os dois WAPEs são calculados sobre os mesmos "
+            "registros e por isso são idênticos. O relatório provavelmente só lista saldos positivos."
+        )
+    return resumo, None
 
 
 EXTENSOES_EXCEL = (".xlsx", ".xlsm", ".xls")
@@ -1091,7 +1395,7 @@ if arquivo is None:
     )
     st.stop()
 
-@st.cache_resource(show_spinner="Lendo e preparando a base (só na primeira vez)...")
+@st.cache_data(show_spinner="Lendo e preparando a base (só na primeira vez)...", max_entries=4)
 def preparar_base(chave, _conteudo, nome, aba):
     """Lê o arquivo e cria as colunas de análise. Roda uma vez por arquivo/aba; depois vem do cache.
 
@@ -1192,7 +1496,7 @@ def preparar_base(chave, _conteudo, nome, aba):
 
 
 conteudo_arquivo = arquivo.getvalue()
-chave_arquivo = str(getattr(arquivo, "file_id", None) or (arquivo.name, arquivo.size))
+chave_arquivo = hashlib.sha256(conteudo_arquivo).hexdigest()
 abas = listar_abas(chave_arquivo, conteudo_arquivo, arquivo.name)
 if len(abas) > 1:
     aba_escolhida = st.sidebar.selectbox("Aba da planilha", abas)
@@ -1556,6 +1860,87 @@ if aba_ativa == ABA_PROJECOES:
         "As faixas mostram a incerteza estimada a partir dos erros históricos; não são garantias de resultado."
     )
 
+    # Histórico de estoque: upload independente da base de vendas.
+    with st.expander("Histórico de estoques · validação de disponibilidade", expanded=True):
+        st.caption(
+            "Importe um relatório com as colunas **Código**, **Quantidade** e **Data**. "
+            "O campo Código é tratado como **SKU** e cruzado com a base de vendas. "
+            "O saldo mais recente pode ser usado como restrição probabilística de atendimento nas projeções."
+        )
+        arquivo_estoque = st.file_uploader(
+            "Importar relatório histórico de estoques",
+            type=["xlsx", "xlsm", "xls", "csv"],
+            key="upload_historico_estoque",
+            help="Formato esperado: Código | Quantidade | Data. Código = SKU."
+        )
+        if arquivo_estoque is not None:
+            try:
+                conteudo_estoque = arquivo_estoque.getvalue()
+                estoque_validado, diagnostico_estoque = ler_relatorio_estoque_em_cache(
+                    conteudo_estoque, arquivo_estoque.name
+                )
+                st.session_state["historico_estoque_validado"] = estoque_validado
+                st.session_state["diagnostico_historico_estoque"] = diagnostico_estoque
+                d1, d2, d3, d4 = st.columns(4)
+                d1.metric("Linhas válidas", f'{diagnostico_estoque["linhas_validas"]:,}'.replace(",", "."))
+                d2.metric("SKUs no estoque", f'{diagnostico_estoque["skus"]:,}'.replace(",", "."))
+                d3.metric("Linhas descartadas", f'{diagnostico_estoque["linhas_descartadas"]:,}'.replace(",", "."))
+                d4.metric("Duplicatas SKU/data", f'{diagnostico_estoque["duplicatas_sku_data"]:,}'.replace(",", "."))
+                st.caption(
+                    f"Período do estoque: **{estoque_validado['Data'].min():%d/%m/%Y} a "
+                    f"{estoque_validado['Data'].max():%d/%m/%Y}**. "
+                    "Se houver mais de uma linha para o mesmo SKU e data, revise se o relatório contém depósitos separados."
+                )
+                st.dataframe(estoque_validado.head(100), use_container_width=True, hide_index=True)
+                sku_vendas_estoque = col.get("sku") or col_produto
+                diagnostico_wape, aviso_wape = calcular_diagnostico_estoque_vendas(
+                    filtrado, estoque_validado, sku_vendas_estoque
+                )
+                if aviso_wape:
+                    st.info(aviso_wape)
+                elif isinstance(diagnostico_wape, dict):
+                    st.markdown("**Validação exploratória do impacto do estoque no erro**")
+                    st.caption(
+                        "Este diagnóstico usa a venda do mês anterior como referência simples (baseline), "
+                        "não o modelo probabilístico selecionado. O WAPE em meses com estoque positivo ajuda "
+                        "a verificar se meses sem disponibilidade distorcem a avaliação; não representa ainda "
+                        "uma melhoria comprovada do modelo."
+                    )
+                    w1, w2, w3 = st.columns(3)
+                    v_all = diagnostico_wape["WAPE ingênuo — todos os meses com estoque registrado (%)"]
+                    v_pos = diagnostico_wape["WAPE ingênuo — meses com estoque positivo (%)"]
+                    w1.metric("WAPE baseline · todos", f"{v_all:.1f}%" if pd.notna(v_all) else "N/D")
+                    w2.metric("WAPE baseline · estoque positivo", f"{v_pos:.1f}%" if pd.notna(v_pos) else "N/D")
+                    w3.metric("Cobertura SKU-mês", f'{diagnostico_wape["Cobertura SKU-mês do relatório (%)"]:.1f}%')
+                    st.dataframe(pd.DataFrame([
+                        {"Indicador": k, "Resultado": v}
+                        for k, v in diagnostico_wape.items()
+                    ]), use_container_width=True, hide_index=True)
+                st.success("Relatório de estoque validado e cruzado por SKU.")
+            except Exception as exc:
+                st.session_state.pop("historico_estoque_validado", None)
+                st.session_state.pop("diagnostico_historico_estoque", None)
+                st.error(f"Não foi possível validar o relatório de estoque: {exc}")
+        elif "historico_estoque_validado" in st.session_state:
+            estoque_validado = st.session_state["historico_estoque_validado"]
+            diag = st.session_state.get("diagnostico_historico_estoque", {})
+            st.success(
+                f"Relatório carregado na sessão: {diag.get('skus', estoque_validado['SKU'].nunique())} SKUs, "
+                f"{len(estoque_validado):,} linhas válidas.".replace(",", ".")
+            )
+
+    usar_estoque_modelo = st.checkbox(
+        "Considerar estoque disponível no modelo probabilístico",
+        value=True,
+        key="usar_estoque_modelo_probabilistico",
+        help=(
+            "Limita cada simulação pelo estoque mais recente por SKU e consome o saldo mês a mês. "
+            "Como não há dados de reposição, assume estoque sem reposição futura."
+        ),
+    )
+    if usar_estoque_modelo and "historico_estoque_validado" not in st.session_state:
+        st.info("Importe o histórico de estoque acima para ativar a restrição probabilística de disponibilidade.")
+
     # Escolha da dimensão permite projetar cada série comercial separadamente.
     dimensoes_proj = {"Visão geral": None}
     if col_produto:
@@ -1587,8 +1972,8 @@ if aba_ativa == ABA_PROJECOES:
     rotulo_metrica_proj = "Faturamento (R$)" if metrica_proj == "Faturamento" else "Quantidade vendida (unidades)"
     rotulo_realizado_proj = "Faturamento realizado (R$)" if metrica_proj == "Faturamento" else "Quantidade vendida (unidades)"
     rotulo_unidade_proj = "R$" if metrica_proj == "Faturamento" else "unidades"
-    base_proj = filtrado.copy()
     coluna_grupo_proj = dimensoes_proj[dimensao_proj]
+    base_proj = filtrado.copy() if coluna_grupo_proj else filtrado
     item_proj = None
     if coluna_grupo_proj:
         opcoes_itens = sorted(base_proj[coluna_grupo_proj].fillna("(Não informado)").astype(str).unique().tolist())
@@ -1606,8 +1991,23 @@ if aba_ativa == ABA_PROJECOES:
             st.text_input("Série projetada", value=f"{metrica_proj} total filtrado", disabled=True)
 
     with c_horiz:
-        horizonte_proj = st.selectbox("Horizonte", [3, 6, 12, 18, 24], index=2,
-                                      format_func=lambda n: f"{n} meses", key="horizonte_projecao_mensal")
+        # Selectbox com chave nova evita que o estado antigo do number_input
+        # impeça a interface de refletir corretamente o horizonte selecionado.
+        horizonte_proj = int(st.selectbox(
+            "Horizonte (meses)",
+            options=list(range(1, 25)),
+            index=11,
+            format_func=lambda n: f"{n} mês" if n == 1 else f"{n} meses",
+            key="horizonte_projecao_mensal_v2",
+            help="Escolha de 1 a 24 meses. A projeção será recalculada para o horizonte selecionado."
+        ))
+        primeiro_mes_proj = pd.Timestamp.today().to_period("M") + 1
+        ultimo_mes_proj = primeiro_mes_proj + horizonte_proj - 1
+        if horizonte_proj == 1:
+            faixa_meses_proj = primeiro_mes_proj.strftime("%m/%Y")
+        else:
+            faixa_meses_proj = f"{primeiro_mes_proj.strftime('%m/%Y')} a {ultimo_mes_proj.strftime('%m/%Y')}"
+        st.caption(f"Período: **{faixa_meses_proj}**")
     with c_sim:
         simulacoes_proj = st.selectbox("Simulações", [1000, 3000, 5000], index=1,
                                        format_func=lambda n: f"{n:,}".replace(",", "."), key="simulacoes_projecao_mensal")
@@ -1616,12 +2016,115 @@ if aba_ativa == ABA_PROJECOES:
                f" · Métrica: **{metrica_proj}** · {len(base_proj):,} registros após os filtros ativos".replace(",", "."))
 
     try:
-        resultado_proj = projetar_meses(
-            base_proj, horizonte=int(horizonte_proj), simulacoes=int(simulacoes_proj),
-            coluna_data="_data", coluna_valor=coluna_valor_proj,
+        # A assinatura muda quando a série filtrada muda. Se dados e parâmetros
+        # forem iguais, o resultado é recuperado do cache sem repetir o backtest.
+        assinatura_proj = assinatura_dados_projecao(base_proj, coluna_valor_proj)
+        data_referencia_proj = pd.Timestamp.today().normalize().isoformat()
+        assinatura_estoque_proj = ""
+        if usar_estoque_modelo and "historico_estoque_validado" in st.session_state:
+            df_estoque_cache = st.session_state["historico_estoque_validado"]
+            assinatura_estoque_proj = hashlib.sha256(
+                pd.util.hash_pandas_object(df_estoque_cache, index=True).values.tobytes()
+            ).hexdigest()
+        chave_cache_proj = (
+            assinatura_proj,
+            assinatura_estoque_proj,
+            int(horizonte_proj),
+            int(simulacoes_proj),
+            coluna_valor_proj,
+            data_referencia_proj,
+            "2026-10-27-v4-escala-original-perf",
+        )
+        resultado_proj = projetar_meses_em_cache(
+            chave_cache_proj,
+            base_proj,
+            int(horizonte_proj),
+            int(simulacoes_proj),
+            "_data",
+            coluna_valor_proj,
+            data_referencia_proj,
+            "2026-10-27-v4-escala-original-perf",
         )
     except Exception as exc:
         resultado_proj = {"ok": False, "erro": f"Não foi possível calcular a projeção: {exc}"}
+
+    # Com estoque ativo, a engine passa a projetar cada SKU individualmente,
+    # limitar cada simulação pelo saldo e somar os caminhos ajustados.
+    if usar_estoque_modelo and "historico_estoque_validado" in st.session_state and resultado_proj.get("ok"):
+        coluna_sku_para_estoque = col.get("sku")
+        if coluna_sku_para_estoque and coluna_sku_para_estoque in base_proj.columns:
+            try:
+                resultado_estoque = projetar_com_estoque_em_cache(
+                    chave_cache_proj + (str(coluna_sku_para_estoque),),
+                    base_proj,
+                    st.session_state["historico_estoque_validado"],
+                    int(horizonte_proj),
+                    int(simulacoes_proj),
+                    "_data",
+                    coluna_valor_proj,
+                    coluna_sku_para_estoque,
+                    data_referencia_proj,
+                )
+                if resultado_estoque.get("ok"):
+                    resultado_proj = resultado_estoque
+                    st.session_state["diagnostico_modelo_probabilistico_estoque"] = {
+                        "aplicado": True,
+                        "skus_modelados": resultado_estoque.get("skus_projetados", 0),
+                        "wape_sem_estoque": resultado_estoque.get("wape_backtest_sem_estoque", np.nan),
+                        "wape_com_estoque": resultado_estoque.get("wape_backtest_com_estoque", np.nan),
+                        "n_testes": resultado_estoque.get("n_testes_backtest_estoque", 0),
+                    }
+                    st.success(
+                        f"Engine por SKU com estoque aplicada: {resultado_estoque.get('skus_projetados', 0)} SKUs projetados. "
+                        "Cada SKU foi limitado individualmente e as simulações foram somadas após o ajuste."
+                    )
+                    data_max_estoque = pd.to_datetime(
+                        st.session_state["historico_estoque_validado"]["Data"], errors="coerce"
+                    ).max()
+                    if pd.notna(data_max_estoque):
+                        dias_estoque = (pd.Timestamp(data_referencia_proj).normalize() - data_max_estoque.normalize()).days
+                        if dias_estoque > 60:
+                            st.warning(
+                                f"O saldo de estoque mais recente tem {dias_estoque} dias. "
+                                "Como não há reposições futuras informadas, a restrição pode não refletir o saldo atual."
+                            )
+                    comparacao_estoque = resultado_estoque.get("comparacao_wape_estoque")
+                    if isinstance(comparacao_estoque, pd.DataFrame) and not comparacao_estoque.empty:
+                        st.markdown("**Backtest comparável: WAPE com e sem restrição de estoque**")
+                        st.caption(
+                            "Comparação walk-forward nos mesmos SKU-mês com saldo de estoque registrado antes do mês previsto. "
+                            "O WAPE menor indica melhor precisão nesta amostra; o estoque histórico incompleto pode reduzir a cobertura."
+                        )
+                        st.dataframe(comparacao_estoque, use_container_width=True, hide_index=True)
+                        w0 = resultado_estoque.get("wape_backtest_sem_estoque", np.nan)
+                        w1 = resultado_estoque.get("wape_backtest_com_estoque", np.nan)
+                        nbt = resultado_estoque.get("n_testes_backtest_estoque", 0)
+                        k1, k2, k3 = st.columns(3)
+                        k1.metric("WAPE sem estoque", f"{w0:.2f}%" if pd.notna(w0) else "N/D")
+                        k2.metric("WAPE com estoque", f"{w1:.2f}%" if pd.notna(w1) else "N/D")
+                        if pd.notna(w0) and pd.notna(w1):
+                            delta_wape = w1 - w0
+                            k3.metric("Variação do WAPE", f"{delta_wape:+.2f} p.p.", delta_color="inverse")
+                        else:
+                            k3.metric("Pontos avaliados", f"{nbt:,}".replace(",", "."))
+                        if nbt < 10:
+                            st.warning("A amostra de backtest é pequena; não é possível concluir com segurança se o estoque melhora a previsão.")
+                        elif pd.notna(w0) and pd.notna(w1):
+                            if w1 < w0:
+                                st.success("Nesta amostra, a restrição de estoque reduziu o WAPE. Isso é evidência histórica, não garantia futura.")
+                            elif w1 > w0:
+                                st.warning("Nesta amostra, a restrição de estoque aumentou o WAPE. O ajuste não melhorou a precisão nesse recorte.")
+                            else:
+                                st.info("Nesta amostra, o WAPE ficou igual com e sem a restrição de estoque.")
+                else:
+                    st.warning("A projeção com estoque não foi aplicada: " + resultado_estoque.get("erro", "motivo não informado"))
+            except Exception as exc:
+                st.warning(f"Não foi possível calcular a projeção por SKU com estoque: {exc}")
+        else:
+            st.warning(
+                "A base de vendas não possui uma coluna SKU explícita. "
+                "O campo Produto não será usado como substituto automático do Código."
+            )
 
     if not resultado_proj.get("ok"):
         st.warning(resultado_proj.get("erro", "Não há dados suficientes para projetar."))
@@ -1632,12 +2135,93 @@ if aba_ativa == ABA_PROJECOES:
         )
     else:
         previsoes_proj = resultado_proj["previsoes"].copy()
-        historico_proj = resultado_proj["historico_df"].copy()
-        # A engine usa nomes genéricos de faturamento internamente; a interface
-        # apresenta a unidade correta conforme a métrica selecionada.
-        coluna_historico_engine = "Faturamento realizado (R$)"
-        historico_proj = historico_proj.rename(columns={coluna_historico_engine: rotulo_realizado_proj})
-        comparacao_proj = resultado_proj["comparacao"].copy()
+        historico_proj = resultado_proj.get("historico_df", pd.DataFrame())
+        if not isinstance(historico_proj, pd.DataFrame):
+            historico_proj = pd.DataFrame()
+        historico_proj = historico_proj.copy()
+
+        # Compatibilidade defensiva entre versões da engine. Algumas retornam
+        # "Faturamento realizado (R$)", outras "Valor realizado". O nome antigo
+        # pode não existir; nesse caso não basta chamar rename(), pois rename não
+        # cria a coluna de destino e o gráfico termina em KeyError.
+        # Prioriza a coluna correta para a métrica ativa. Em versões antigas da
+        # engine o nome monetário também era preenchido para quantidade; por isso
+        # nunca devemos usar essa coluna como origem quando a métrica for unidades.
+        candidatos_realizado = (
+            [rotulo_realizado_proj, "Valor realizado", "Realizado", "Valor histórico", "_valor"]
+            if metrica_proj == "Faturamento"
+            else [rotulo_realizado_proj, "Quantidade vendida (unidades)", "Valor realizado", "Realizado", "Valor histórico", "_quantidade"]
+        )
+        coluna_origem_realizado = localizar_coluna(historico_proj, candidatos_realizado)
+        if coluna_origem_realizado is not None:
+            historico_proj[rotulo_realizado_proj] = pd.to_numeric(
+                historico_proj[coluna_origem_realizado], errors="coerce"
+            )
+
+        # Se a versão da engine não trouxer nenhuma coluna de realizado útil,
+        # reconstrói o histórico a partir da própria base filtrada (sem inventar
+        # zeros para meses sem registro). O mês corrente é marcado como parcial.
+        coluna_alvo_ok = (
+            rotulo_realizado_proj in historico_proj.columns
+            and pd.to_numeric(historico_proj[rotulo_realizado_proj], errors="coerce").notna().any()
+        )
+        estrutura_ok = {"Mês", "Tipo"}.issubset(historico_proj.columns)
+        if not coluna_alvo_ok or not estrutura_ok:
+            if "_data" in base_proj.columns and coluna_valor_proj in base_proj.columns:
+                dados_hist = base_proj[["_data", coluna_valor_proj]].copy()
+                dados_hist["_data"] = pd.to_datetime(dados_hist["_data"], errors="coerce", dayfirst=True)
+                dados_hist[coluna_valor_proj] = pd.to_numeric(dados_hist[coluna_valor_proj], errors="coerce")
+                dados_hist = dados_hist.dropna(subset=["_data", coluna_valor_proj])
+                if not dados_hist.empty:
+                    dados_hist["Período"] = dados_hist["_data"].dt.to_period("M")
+                    resumo_hist = dados_hist.groupby("Período", as_index=False)[coluna_valor_proj].sum()
+                    mes_corrente_hist = pd.Timestamp.today().to_period("M")
+                    linhas_hist = []
+                    for _, linha_hist in resumo_hist.iterrows():
+                        periodo_hist = linha_hist["Período"]
+                        linhas_hist.append({
+                            "Período": periodo_hist,
+                            "Mês": periodo_hist.strftime("%m/%Y"),
+                            rotulo_realizado_proj: float(linha_hist[coluna_valor_proj]),
+                            "Tipo": "Realizado parcial" if periodo_hist == mes_corrente_hist else "Realizado",
+                        })
+                    historico_proj = pd.DataFrame(linhas_hist)
+
+        # Última salvaguarda: impede KeyError no gráfico e deixa o problema visível.
+        # Se não houver dados recuperáveis, a coluna fica vazia (NaN), nunca zero fabricado.
+        if rotulo_realizado_proj not in historico_proj.columns:
+            historico_proj[rotulo_realizado_proj] = np.nan
+        if "Mês" not in historico_proj.columns:
+            historico_proj["Mês"] = pd.Series(dtype="object")
+        if "Tipo" not in historico_proj.columns:
+            historico_proj["Tipo"] = pd.Series(dtype="object")
+        if historico_proj[rotulo_realizado_proj].isna().all():
+            st.warning(
+                "A engine não retornou valores históricos para o gráfico. "
+                "Confira a versão de engine_projecao.py e as colunas de data e métrica da base."
+            )
+        # Compatibilidade entre a projeção de uma única série e a projeção
+        # consolidada por SKU. A versão consolidada expõe "modelos_por_sku"
+        # em vez de "comparacao"; não acessar a chave diretamente.
+        comparacao_bruta = resultado_proj.get("comparacao")
+        if isinstance(comparacao_bruta, pd.DataFrame):
+            comparacao_proj = comparacao_bruta.copy()
+        else:
+            comparacao_por_sku = resultado_proj.get("modelos_por_sku")
+            if isinstance(comparacao_por_sku, pd.DataFrame) and not comparacao_por_sku.empty:
+                comparacao_proj = comparacao_por_sku.copy()
+                comparacao_proj = comparacao_proj.rename(columns={
+                    "Modelo selecionado": "Modelo",
+                    "WAPE retroativo (%)": "WAPE retroativo (%)",
+                    "MAE (R$)": "MAE (R$)",
+                    "Viés médio (R$)": "Viés médio (R$)",
+                    "Períodos históricos": "Períodos históricos",
+                })
+            else:
+                comparacao_proj = pd.DataFrame(columns=[
+                    "Modelo", "WAPE retroativo (%)", "MAE (R$)",
+                    "Viés médio (R$)", "Testes retroativos"
+                ])
         unidade_erro = "R$" if metrica_proj == "Faturamento" else "unidades"
         comparacao_proj = comparacao_proj.rename(columns={
             "MAE (R$)": f"MAE ({unidade_erro})",
@@ -1646,12 +2230,17 @@ if aba_ativa == ABA_PROJECOES:
         wape_proj, mae_proj = resultado_proj.get("wape"), resultado_proj.get("mae")
 
         m1, m2, m3, m4 = st.columns(4, gap="small")
-        m1.metric("Modelo selecionado", resultado_proj["modelo_rotulo"])
-        m2.metric("Erro WAPE no backtest", f"{wape_proj:.1f}%" if pd.notna(wape_proj) and wape_proj != float("inf") else "N/D")
+        m1.metric("Modelo selecionado", resultado_proj.get("modelo_rotulo", "Seleção individual por SKU"))
+        _w_sku = resultado_proj.get("wape_sku_mes")
+        m2.metric(
+            "Erro WAPE no backtest", f"{wape_proj:.1f}%" if pd.notna(wape_proj) and wape_proj != float("inf") else "N/D",
+            help=("WAPE sobre o total mensal (soma dos SKUs), coerente com a projeção consolidada. "
+                  + (f"No nível SKU-mês, mais severo, o WAPE é {_w_sku:.1f}%." if _w_sku is not None and pd.notna(_w_sku) else "")),
+        )
         m3.metric("Erro médio absoluto", (moeda(mae_proj) if metrica_proj == "Faturamento" else f"{mae_proj:,.1f} unidades".replace(",", ".")) if pd.notna(mae_proj) else "N/D")
-        m4.metric("Meses históricos", str(resultado_proj["n_meses"]))
+        m4.metric("Meses históricos", str(resultado_proj.get("n_meses", len(resultado_proj.get("historico", [])))))
 
-        if resultado_proj["n_meses"] < 24:
+        if resultado_proj.get("n_meses", len(resultado_proj.get("historico", []))) < 24:
             st.warning("O histórico ainda é curto para avaliar com segurança a sazonalidade anual. As projeções e intervalos devem ser interpretados com cautela.")
         if resultado_proj.get("mes_parcial") is not None:
             mes_p = resultado_proj["mes_parcial"]
@@ -1677,16 +2266,8 @@ if aba_ativa == ABA_PROJECOES:
                 line=dict(color="#9298a1", width=2), marker=dict(size=5),
                 hovertemplate=("%{x}<br>Realizado: R$ %{y:,.2f}<extra></extra>" if metrica_proj == "Faturamento" else "%{x}<br>Quantidade realizada: %{y:,.0f} unidades<extra></extra>"),
             ))
-        fig_proj.add_trace(go.Scatter(
-            x=previsoes_proj["Mês"], y=previsoes_proj["Limite superior 90% (P95)"],
-            name="Limite superior 90%", mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip",
-        ))
-        fig_proj.add_trace(go.Scatter(
-            x=previsoes_proj["Mês"], y=previsoes_proj["Limite inferior 90% (P05)"],
-            name="Intervalo probabilístico 90%", mode="lines", fill="tonexty",
-            fillcolor="rgba(120,128,140,0.18)", line=dict(width=0),
-            hovertemplate=("%{x}<br>Limite inferior 90%: R$ %{y:,.2f}<extra></extra>" if metrica_proj == "Faturamento" else "%{x}<br>Limite inferior 90%: %{y:,.0f} unidades<extra></extra>"),
-        ))
+        # O gráfico mostra a faixa central de 80%. Os limites de 90% continuam
+        # disponíveis na tabela, mas não comprimem o eixo Y em séries voláteis.
         fig_proj.add_trace(go.Scatter(
             x=previsoes_proj["Mês"], y=previsoes_proj["Limite superior 80% (P90)"],
             name="Limite superior 80%", mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip",
@@ -1735,7 +2316,6 @@ if aba_ativa == ABA_PROJECOES:
         for nome_coluna in (
             "Previsão central (P50)",
             "Limite inferior 80% (P10)", "Limite superior 80% (P90)",
-            "Limite inferior 90% (P05)", "Limite superior 90% (P95)",
         ):
             if nome_coluna in previsoes_proj:
                 valores_eixo.extend(pd.to_numeric(
@@ -1771,10 +2351,10 @@ if aba_ativa == ABA_PROJECOES:
             ),
         )
         if metrica_proj == "Faturamento":
-            fig_proj.update_yaxes(tickprefix="R$ ", ticksuffix="", tickformat="~s")
+            fig_proj.update_yaxes(tickprefix="R$ ", ticksuffix="", tickformat=",.0f", rangemode="tozero")
         else:
             # Quantidade é exibida como número de unidades, nunca na escala monetária.
-            fig_proj.update_yaxes(tickprefix="", ticksuffix="", tickformat=",.0f")
+            fig_proj.update_yaxes(tickprefix="", ticksuffix="", tickformat=",.0f", rangemode="tozero")
         exibir_grafico_padronizado(
             fig_proj, use_container_width=True, config={"displayModeBar": False},
             key="grafico_projecao_probabilistica_mensal",
@@ -1799,7 +2379,7 @@ if aba_ativa == ABA_PROJECOES:
             file_name=f"projecao_mensal_{dimensao_proj.lower().replace(' ', '_')}.csv", mime="text/csv",
         )
         with st.expander("Avaliação dos modelos no histórico", expanded=False):
-            st.caption("O backtest prevê um mês à frente usando somente dados anteriores. WAPE menor indica menor erro absoluto relativo ao volume realizado; com poucos testes, a classificação pode ser instável.")
+            st.caption("O backtest seleciona o modelo usando previsões históricas de um mês à frente. O modelo escolhido é estendido ao horizonte informado (até 24 meses); quanto mais distante, maior a incerteza. WAPE menor indica menor erro absoluto relativo ao volume realizado; com poucos testes, a classificação pode ser instável.")
             st.dataframe(comparacao_proj, use_container_width=True, hide_index=True, column_config={
                 "WAPE retroativo (%)": st.column_config.NumberColumn(format="%.2f%%"),
                 f"MAE ({unidade_erro})": st.column_config.NumberColumn(format=("R$ %.2f" if metrica_proj == "Faturamento" else "%.0f")),
