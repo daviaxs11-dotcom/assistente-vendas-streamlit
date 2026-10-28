@@ -31,6 +31,7 @@
 # Modelo (opcional): variável de ambiente GEMINI_MODEL.
 
 import json
+import math
 import difflib
 
 import os
@@ -53,7 +54,7 @@ from google import genai
 
 from google.genai import types
 
-MODELO_GEMINI = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+MODELO_GEMINI = (os.environ.get("GEMINI_MODEL") or "").strip() or "gemini-3.5-flash-lite"
 
 MAX_CONSULTAS = 4            # consultas por pergunta
 
@@ -64,9 +65,19 @@ LIMITE_MAXIMO = 200          # máximo de linhas por consulta
 MAX_LINHAS_TOTAIS = 300      # máximo de linhas somando todas as consultas
 
 MAX_VALORES_LISTADOS = 40    # valores listados no esquema para dimensões pequenas
-MIN_REGISTROS_GRUPO_PRIVACIDADE = 0  # bloqueia divulgação de grupos com menos de cinco registros
+MIN_REGISTROS_GRUPO_PRIVACIDADE = 5  # bloqueia divulgação de grupos com menos de cinco registros
 
 TURNOS_HISTORICO = 4         # turnos anteriores enviados ao planejador
+
+# Limites de validação de entradas
+MAX_CHARS_PERGUNTA = 1000    # tamanho máximo da pergunta digitada
+MAX_FILTROS = 8              # filtros por consulta
+MAX_VALORES_FILTRO = 20      # valores por filtro
+MAX_CHARS_VALOR_FILTRO = 120 # tamanho máximo de cada valor de filtro
+MIN_CHARS_FILTRO_CONTEM = 2  # busca por trecho com menos caracteres é rejeitada
+ANO_MINIMO, ANO_MAXIMO = 1900, 2100
+LIMITES_FILTRO_TEMPO = {"ano": (ANO_MINIMO, ANO_MAXIMO), "trimestre_do_ano": (1, 4), "mes_do_ano": (1, 12)}
+REGEX_NUMERO = re.compile(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?")
 
 # ============================================================
 
@@ -294,56 +305,51 @@ def localizar_coluna_opcional(df, colunas_possiveis):
         return None
 
 def converter_valor(valor):
-
-    """Converte valores monetários (formato brasileiro ou internacional) para float."""
-
-    if pd.isna(valor):
-
+    """Converte valores monetários (formato brasileiro ou internacional) para float.
+    Devolve None para vazio, booleano, NaN/infinito ou texto que não seja um número."""
+    if valor is None or isinstance(valor, bool):
         return None
-
-    if isinstance(valor, (int, float)):
-
-        return float(valor)
-
-    texto = str(valor).strip()
-
-    if not texto:
-
-        return None
-
-    texto = texto.replace("R$", "").replace("\u00a0", "").replace(" ", "")
-
-    if "," in texto and "." in texto:
-
-        if texto.rfind(",") > texto.rfind("."):
-
-            texto = texto.replace(".", "").replace(",", ".")
-
-        else:
-
-            texto = texto.replace(",", "")
-
-    elif "," in texto:
-
-        texto = texto.replace(",", ".")
-
     try:
-
-        return float(texto)
-
-    except (ValueError, TypeError):
-
+        if pd.isna(valor):
+            return None
+    except (TypeError, ValueError):
         return None
+    if isinstance(valor, (int, float)):
+        numero = float(valor)
+        return numero if math.isfinite(numero) else None
+    texto = str(valor).strip()
+    if not texto:
+        return None
+    negativo = False
+    if texto.startswith("(") and texto.endswith(")"):  # notação contábil: (1.234,56)
+        negativo, texto = True, texto[1:-1]
+    texto = texto.replace("R$", "").replace("\u00a0", "").replace(" ", "")
+    if texto.endswith("-"):  # "123,45-"
+        negativo, texto = True, texto[:-1]
+    if "," in texto and "." in texto:
+        if texto.rfind(",") > texto.rfind("."):
+            texto = texto.replace(".", "").replace(",", ".")
+        else:
+            texto = texto.replace(",", "")
+    elif "," in texto:
+        texto = texto.replace(",", "") if texto.count(",") > 1 else texto.replace(",", ".")
+    elif texto.count(".") > 1:  # só pontos como separador de milhar: 1.234.567
+        texto = texto.replace(".", "")
+    # Rejeita "nan", "inf", "1_000" e lixo textual que float() aceitaria ou interpretaria mal.
+    if not REGEX_NUMERO.fullmatch(texto):
+        return None
+    numero = float(texto)
+    if not math.isfinite(numero):
+        return None
+    return -abs(numero) if negativo else numero
 
 def _valores(serie):
-
-    """Série numérica (float; NaN quando inválido). Colunas já numéricas não passam por conversão linha a linha."""
-
+    """Série numérica (float; NaN quando inválido ou infinito). Colunas já numéricas não passam por conversão linha a linha."""
     if pd.api.types.is_numeric_dtype(serie):
-
-        return pd.to_numeric(serie, errors="coerce").astype(float)
-
-    return serie.map(converter_valor).astype(float)
+        numeros = pd.to_numeric(serie, errors="coerce").astype(float)
+    else:
+        numeros = serie.map(converter_valor).astype(float)
+    return numeros.replace([float("inf"), float("-inf")], float("nan"))
 
 def sanitizar_valor_textual(valor):
     """Remove padrões comuns de dados pessoais antes de qualquer texto chegar ao Gemini."""
@@ -758,6 +764,10 @@ class Quadro:
         self.cols = cols
 
         self.tab = pd.DataFrame({"v": _valores(df[cols["valor"]]).to_numpy()})
+        if not self.tab["v"].notna().any():
+            raise ValueError(
+                f"A coluna de valor '{cols['valor']}' não tem nenhum número válido; verifique o formato dos valores."
+            )
 
         if cols.get("qtd"):
 
@@ -1332,209 +1342,214 @@ def _chave(x):
 
     return normalizar(x).replace(" ", "_")
 
-def _validar_consulta(c, dims_agrupar, filtros_validos, metricas_validas, tem_data):
-
-    agrupar = []
-
-    for d in _lista(c.get("agrupar_por")):
-
-        d = _chave(d)
-
-        if d not in dims_agrupar:
-
-            raise ValueError(f"agrupamento por '{d}' indisponível nos dados")
-
-        if d not in agrupar:
-
-            agrupar.append(d)
-
-    if len(agrupar) > 3:
-
-        raise ValueError("agrupamentos demais (máximo 3)")
-
-    metricas = []
-
-    for m in _lista(c.get("metricas")):
-
-        m = _chave(m)
-
-        m = METRICA_SINONIMOS.get(m, m)
-
-        if m not in metricas_validas:
-
-            raise ValueError(f"métrica '{m}' indisponível nos dados")
-
-        if m not in metricas:
-
-            metricas.append(m)
-
-    if not metricas:
-
-        metricas = ["faturamento"]
-
-    filtros = []
-
-    for f in _lista(c.get("filtros")):
-
-        if not isinstance(f, dict):
-
-            raise ValueError("filtro inválido")
-
-        dim = _chave(f.get("dimensao") or "")
-
-        if dim not in filtros_validos:
-
-            raise ValueError(f"filtro por '{dim}' indisponível nos dados")
-
-        op = OPERADORES.get(_chave(f.get("operador") or "igual"))
-
-        if op is None:
-
-            raise ValueError("operador de filtro inválido")
-
-        valores = [v for v in _lista(f.get("valores", f.get("valor"))) if isinstance(v, (str, int, float)) and str(v).strip() != ""][:20]
-
-        if not valores:
-
-            raise ValueError(f"filtro de '{dim}' sem valores")
-
-        if dim in FILTROS_TEMPO:
-
-            try:
-
-                valores = [int(float(v)) for v in valores]
-
-            except (TypeError, ValueError):
-
-                raise ValueError(f"valores inválidos para o filtro '{dim}'")
-
-        filtros.append({"dimensao": dim, "operador": op, "valores": valores})
-
-    periodo = None
-
-    p = c.get("periodo")
-
-    if p:
-
-        if not tem_data:
-
-            raise ValueError("a base não tem coluna de data para filtrar período")
-
-        if not isinstance(p, dict):
-
-            raise ValueError("período inválido")
-
-        periodo = {}
-
-        for campo in ("inicio", "fim"):
-
-            if p.get(campo):
-
-                data = pd.to_datetime(p.get(campo), errors="coerce")
-
-                if pd.isna(data):
-
-                    raise ValueError(f"data de {campo} do período inválida")
-
-                periodo[campo] = data.strftime("%Y-%m-%d")
-
-        periodo = periodo or None
-
-    ultima = bool(c.get("somente_ultima_data"))
-
-    if ultima:
-
-        if not tem_data:
-
-            raise ValueError("última data exige coluna de data")
-
-        if "data_ultima" not in metricas:
-
-            metricas.append("data_ultima")
-
-    ordenar = _chave(c["ordenar_por"]) if c.get("ordenar_por") else None
-
-    if ordenar not in set(agrupar) | set(metricas):
-
-        ordenar = None
-
-    direcao = _chave(c.get("direcao") or "")
-
-    direcao = "asc" if direcao in {"asc", "crescente"} else "desc" if direcao in {"desc", "decrescente"} else None
-
+def _como_bool(valor):
+    """Interpreta booleanos vindos do modelo ("false" como texto não pode virar True)."""
+    if valor is None:
+        return False
+    if isinstance(valor, bool):
+        return valor
+    if isinstance(valor, (int, float)) and valor in (0, 1):
+        return bool(valor)
+    if isinstance(valor, str):
+        t = normalizar(valor)
+        if t in {"true", "verdadeiro", "sim", "s", "yes", "1"}:
+            return True
+        if t in {"false", "falso", "nao", "n", "no", "0", ""}:
+            return False
+    raise ValueError("valor booleano inválido")
+
+
+def _inteiro_ou_none(valor):
+    """Inteiro estrito: rejeita bool, NaN, infinito, decimais não inteiros e números gigantes."""
+    if valor is None or isinstance(valor, bool):
+        return None
     try:
+        numero = float(valor.strip().replace(",", ".") if isinstance(valor, str) else valor)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(numero) or not numero.is_integer():
+        return None
+    return int(numero)
 
-        limite = int(c.get("limite") or LIMITE_PADRAO)
 
-    except (TypeError, ValueError):
+def _data_periodo(valor, campo):
+    """Aceita AAAA-MM-DD, AAAA-MM e DD/MM/AAAA. Números soltos (ex.: 2024) e formatos ambíguos são rejeitados."""
+    if not isinstance(valor, str):
+        raise ValueError(f"data de {campo} do período deve ser um texto AAAA-MM-DD")
+    t = valor.strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}(?:[T ].*)?", t):
+        data = pd.to_datetime(t[:10], format="%Y-%m-%d", errors="coerce")
+    elif re.fullmatch(r"\d{4}-\d{2}", t):
+        data = pd.to_datetime(t + "-01", format="%Y-%m-%d", errors="coerce")
+        if not pd.isna(data) and campo == "fim":
+            data = data + pd.offsets.MonthEnd(0)
+    elif re.fullmatch(r"\d{1,2}/\d{1,2}/\d{4}", t):
+        data = pd.to_datetime(t, format="%d/%m/%Y", errors="coerce")
+    else:
+        raise ValueError(f"data de {campo} do período inválida (use AAAA-MM-DD)")
+    if pd.isna(data) or not ANO_MINIMO <= data.year <= ANO_MAXIMO:
+        raise ValueError(f"data de {campo} do período inválida")
+    return data.strftime("%Y-%m-%d")
 
-        limite = LIMITE_PADRAO
 
-    limite = max(1, min(limite, LIMITE_MAXIMO))
-
+def _validar_consulta(c, dims_agrupar, filtros_validos, metricas_validas, tem_data):
+    avisos = []
+    agrupar = []
+    for d in _lista(c.get("agrupar_por")):
+        d = _chave(d)
+        if d not in dims_agrupar:
+            raise ValueError(f"agrupamento por '{d}' indisponível nos dados")
+        if d not in agrupar:
+            agrupar.append(d)
+    if len(agrupar) > 3:
+        raise ValueError("agrupamentos demais (máximo 3)")
+    metricas = []
+    for m in _lista(c.get("metricas")):
+        m = _chave(m)
+        m = METRICA_SINONIMOS.get(m, m)
+        if m not in metricas_validas:
+            raise ValueError(f"métrica '{m}' indisponível nos dados")
+        if m not in metricas:
+            metricas.append(m)
+    if not metricas:
+        metricas = ["faturamento"]
+    filtros = []
+    filtros_brutos = _lista(c.get("filtros"))
+    if len(filtros_brutos) > MAX_FILTROS:
+        raise ValueError(f"filtros demais (máximo {MAX_FILTROS})")
+    for f in filtros_brutos:
+        if not isinstance(f, dict):
+            raise ValueError("filtro inválido")
+        dim = _chave(f.get("dimensao") or "")
+        if dim not in filtros_validos:
+            raise ValueError(f"filtro por '{dim}' indisponível nos dados")
+        op = OPERADORES.get(_chave(f.get("operador") or "igual"))
+        if op is None:
+            raise ValueError("operador de filtro inválido")
+        valores, vistos = [], set()
+        for v in _lista(f.get("valores", f.get("valor"))):
+            if isinstance(v, bool) or not isinstance(v, (str, int, float)):
+                continue
+            if isinstance(v, float):
+                if not math.isfinite(v):
+                    raise ValueError(f"valor inválido no filtro de '{dim}'")
+                if v.is_integer():
+                    v = int(v)
+            if isinstance(v, str):
+                v = v.strip()
+                if not v:
+                    continue
+            if dim in FILTROS_TEMPO:
+                numero = _inteiro_ou_none(v)
+                if numero is None:
+                    raise ValueError(f"valores inválidos para o filtro '{dim}'")
+                minimo, maximo = LIMITES_FILTRO_TEMPO[dim]
+                if not minimo <= numero <= maximo:
+                    raise ValueError(f"valor {numero} fora do intervalo {minimo}-{maximo} no filtro '{dim}'")
+                v, chave_valor = numero, numero
+            else:
+                v = str(v)
+                if len(v) > MAX_CHARS_VALOR_FILTRO:
+                    avisos.append(f"Um valor do filtro '{dim}' foi ignorado por exceder {MAX_CHARS_VALOR_FILTRO} caracteres.")
+                    continue
+                chave_valor = normalizar(v)
+                if op == "contem" and len(chave_valor) < MIN_CHARS_FILTRO_CONTEM:
+                    avisos.append(f"Termo '{v}' ignorado no filtro '{dim}': curto demais para busca por trecho.")
+                    continue
+            if chave_valor in vistos:
+                continue
+            vistos.add(chave_valor)
+            valores.append(v)
+        if not valores:
+            raise ValueError(f"filtro de '{dim}' sem valores")
+        if len(valores) > MAX_VALORES_FILTRO:
+            avisos.append(f"O filtro de '{dim}' foi limitado aos {MAX_VALORES_FILTRO} primeiros valores.")
+            valores = valores[:MAX_VALORES_FILTRO]
+        filtros.append({"dimensao": dim, "operador": op, "valores": valores})
+    periodo = None
+    p = c.get("periodo")
+    if p:
+        if not tem_data:
+            raise ValueError("a base não tem coluna de data para filtrar período")
+        if not isinstance(p, dict):
+            raise ValueError("período inválido")
+        periodo = {}
+        for campo in ("inicio", "fim"):
+            bruto = p.get(campo)
+            if bruto is None or (isinstance(bruto, str) and not bruto.strip()):
+                continue
+            periodo[campo] = _data_periodo(bruto, campo)
+        if periodo.get("inicio") and periodo.get("fim") and periodo["inicio"] > periodo["fim"]:
+            raise ValueError("o início do período é posterior ao fim")
+        periodo = periodo or None
+    try:
+        ultima = _como_bool(c.get("somente_ultima_data"))
+    except ValueError:
+        raise ValueError("valor inválido em 'somente_ultima_data'")
+    if ultima:
+        if not tem_data:
+            raise ValueError("última data exige coluna de data")
+        if "data_ultima" not in metricas:
+            metricas.append("data_ultima")
+    ordenar = None
+    if c.get("ordenar_por"):
+        alvo_ordem = _chave(c["ordenar_por"])
+        alvo_ordem = METRICA_SINONIMOS.get(alvo_ordem, alvo_ordem)
+        if alvo_ordem in set(agrupar) | set(metricas):
+            ordenar = alvo_ordem
+        else:
+            avisos.append(f"Ordenação por '{alvo_ordem}' ignorada: não faz parte do agrupamento nem das métricas.")
+    direcao_bruta = _chave(c.get("direcao") or "")
+    direcao = "asc" if direcao_bruta in {"asc", "crescente"} else "desc" if direcao_bruta in {"desc", "decrescente"} else None
+    if direcao_bruta and direcao is None:
+        avisos.append(f"Direção de ordenação '{direcao_bruta}' desconhecida; usando a padrão.")
+    limite_bruto = c.get("limite")
+    limite = None
+    if limite_bruto not in (None, ""):
+        limite = _inteiro_ou_none(limite_bruto)
+        if limite is None or limite < 1:
+            avisos.append(f"Limite inválido; usando {LIMITE_PADRAO} linhas.")
+            limite = None
+        elif limite > LIMITE_MAXIMO:
+            avisos.append(f"Limite reduzido de {limite} para {LIMITE_MAXIMO} linhas.")
+    limite = max(1, min(limite or LIMITE_PADRAO, LIMITE_MAXIMO))
     return {
-
-        "descricao": str(c.get("descricao") or "")[:200],
-
+        "descricao": re.sub(r"\s+", " ", str(c.get("descricao") or "")).strip()[:200],
         "agrupar_por": agrupar, "metricas": metricas, "filtros": filtros, "periodo": periodo,
-
         "somente_ultima_data": ultima, "ordenar_por": ordenar, "direcao": direcao, "limite": limite,
-
+        "avisos_validacao": avisos,
     }
 
 def validar_plano(bruto, cols, tem_data):
-
     """Valida o JSON do planejador. Retorna (consultas_validas, avisos, esclarecimento)."""
-
     if not isinstance(bruto, dict):
-
         raise ValueError("o planejador não devolveu um objeto JSON")
-
     esclarecimento = bruto.get("esclarecimento")
-
-    esclarecimento = esclarecimento.strip() if isinstance(esclarecimento, str) and esclarecimento.strip() else None
-
+    esclarecimento = esclarecimento.strip()[:600] if isinstance(esclarecimento, str) and esclarecimento.strip() else None
     dims_texto = {d for d in DIMENSOES_TEXTO if cols.get(d)} | set(cols.get("_dinamicas", {}))
-
     tempos_permitidos = set(TEMPO_AGRUPAR)
     if _data_pedido_sensivel(cols):
         tempos_permitidos.discard("dia")
     dims_agrupar = dims_texto | (tempos_permitidos if tem_data else set())
-
     filtros_validos = dims_texto | (set(FILTROS_TEMPO) if tem_data else set())
-
     metricas_validas = {"faturamento", "registros"}
-
     if cols.get("qtd"):
-
         metricas_validas |= {"quantidade", "preco_medio"}
-
     if cols.get("cliente"):
-
         metricas_validas.add("clientes_distintos")
-
     if cols.get("produto"):
-
         metricas_validas.add("produtos_distintos")
-
     if tem_data and not _data_pedido_sensivel(cols):
-
         metricas_validas |= {"data_primeira", "data_ultima"}
     for dim in cols.get("_numericas", {}):
         metricas_validas |= {f"soma_{dim}", f"media_{dim}"}
-
     brutas = _lista(bruto.get("consultas"))
-
-    avisos, consultas = [], []
-
+    avisos, consultas, vistas = [], [], set()
     for i, c in enumerate(brutas[:MAX_CONSULTAS], start=1):
-
         if not isinstance(c, dict):
-
+            avisos.append(f"Consulta {i} ignorada: formato inválido.")
             continue
-
         try:
-
             consulta_validada = _validar_consulta(c, dims_agrupar, filtros_validos, metricas_validas, tem_data)
             if _data_pedido_sensivel(cols):
                 # Defesa adicional: não permitir retorno de datas exatas mesmo se o modelo
@@ -1542,16 +1557,20 @@ def validar_plano(bruto, cols, tem_data):
                 if "dia" in consulta_validada["agrupar_por"]:
                     raise ValueError("agrupamento por dia bloqueado por privacidade de Data Pedido")
                 consulta_validada["metricas"] = [m for m in consulta_validada["metricas"] if m not in {"data_primeira", "data_ultima"}]
-            consultas.append(consulta_validada)
-
-        except ValueError as exc:
-
+        except (ValueError, TypeError, OverflowError) as exc:
             avisos.append(f"Consulta {i} ignorada: {exc}.")
-
+            continue
+        avisos.extend(f"Consulta {i}: {a}" for a in consulta_validada.pop("avisos_validacao", []))
+        assinatura = json.dumps(
+            {k: v for k, v in consulta_validada.items() if k != "descricao"}, sort_keys=True, ensure_ascii=False,
+        )
+        if assinatura in vistas:
+            avisos.append(f"Consulta {i} ignorada: repete uma consulta anterior.")
+            continue
+        vistas.add(assinatura)
+        consultas.append(consulta_validada)
     if len(brutas) > MAX_CONSULTAS:
-
         avisos.append(f"Só as {MAX_CONSULTAS} primeiras consultas foram executadas.")
-
     return consultas, avisos, esclarecimento
 
 # ============================================================
@@ -1873,23 +1892,19 @@ def executar_consulta(quadro, consulta, mapa, limite_maximo=LIMITE_MAXIMO):
 # ============================================================
 
 def _extrair_json(texto):
-
-    t = str(texto).strip()
-
+    t = str(texto or "").strip()
     t = re.sub(r"^```(?:json)?\s*|\s*```$", "", t, flags=re.MULTILINE).strip()
-
+    if not t:
+        raise ValueError("o planejador devolveu uma resposta vazia")
     try:
-
         return json.loads(t)
-
     except json.JSONDecodeError:
-
         ini, fim = t.find("{"), t.rfind("}")
-
         if ini != -1 and fim > ini:
-
-            return json.loads(t[ini:fim + 1])
-
+            try:
+                return json.loads(t[ini:fim + 1])
+            except json.JSONDecodeError:
+                pass
         raise ValueError("a resposta do planejador não é um JSON válido")
 
 def montar_prompt_planejador(pergunta_segura, esquema, historico):
@@ -1941,16 +1956,15 @@ def montar_prompt_resposta(pergunta_segura, resultados, avisos, esquema):
 # ============================================================
 
 def obter_chave_api():
-
     try:
-
         chave = st.secrets["GEMINI_API_KEY"]
-
     except Exception:
-
         chave = None
-
-    return chave or os.environ.get("GEMINI_API_KEY")
+    chave = chave or os.environ.get("GEMINI_API_KEY")
+    if not isinstance(chave, str):
+        return None
+    chave = chave.strip().strip("\"'").strip()
+    return chave or None
 
 @st.cache_resource(show_spinner=False)
 
@@ -1959,47 +1973,32 @@ def _criar_cliente(chave_api):
     return genai.Client(api_key=chave_api)
 
 def consultar_gemini(prompt, chave_api, sistema=INSTRUCOES_IA, json_mode=False, temperatura=0.2):
-
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("O prompt enviado ao modelo está vazio.")
+    if not isinstance(chave_api, str) or not chave_api.strip():
+        raise ValueError("A chave da API do Gemini não foi informada.")
     cliente = _criar_cliente(chave_api)
-
     config = types.GenerateContentConfig(
-
         system_instruction=sistema,
-
-        temperature=temperatura,
-
+        temperature=max(0.0, min(float(temperatura), 2.0)),
         response_mime_type="application/json" if json_mode else None,
-
     )
-
     resposta = None
-
     for tentativa in range(3):
-
         try:
-
             resposta = cliente.models.generate_content(model=MODELO_GEMINI, contents=prompt, config=config)
-
             break
-
         except Exception as exc:
-
             mensagem = str(exc).upper()
-
             temporario = any(t in mensagem for t in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"))
-
             if not temporario or tentativa == 2:
-
                 raise
-
             time.sleep(2 ** (tentativa + 1))
-
     texto = getattr(resposta, "text", None)
-
-    if not texto:
-
-        raise RuntimeError("A API não retornou texto (resposta vazia ou bloqueada).")
-
+    if not texto or not str(texto).strip():
+        bloqueio = getattr(getattr(resposta, "prompt_feedback", None), "block_reason", None)
+        motivo = f" (motivo: {bloqueio})" if bloqueio else ""
+        raise RuntimeError(f"A API não retornou texto (resposta vazia ou bloqueada){motivo}.")
     return texto
 
 
@@ -2480,46 +2479,71 @@ def _consulta_rapida_sem_filtros(pergunta, quadro):
 
 
 def _detectar_consulta_clientes_sem_compra_mes(pergunta):
-    """Reconhece pedido genérico pela lista de clientes sem compra no mês atual.
-
-    Não intercepta perguntas sobre produto/SKU ou cliente específico: essas seguem
-    para o planejador geral.
-    """
+    """Reconhece listas de clientes sem compra num mês, inclusive com departamento."""
     p = normalizar(str(pergunta or ""))
-    if not re.search(r"\bclientes\b", p):
+    if not re.search(r"\bclientes?\b", p):
         return False
     if re.search(r"\b(?:produto|produtos|sku|item|itens|codigo|referencia)\b", p):
         return False
-    pede_lista = bool(re.search(r"\b(?:quais|liste|listar|indique|mostre|mostra|informe|informa|diga|diga-me|me diga)\b", p))
+    pede_lista = bool(re.search(r"\b(?:quais|liste|listar|indique|mostre|mostra|informe|informa|diga|diga-me|me diga|identifique)\b", p))
     sem_compra = bool(
-        re.search(r"\bnao\s+(?:compr\w*|fizeram\s+compra|realizaram\s+compra|tiveram\s+compra|efetuaram\s+compra)\b", p)
+        re.search(r"\bnao\s+(?:compr\w*|comr\w*|fizeram\s+compra|realizaram\s+compra|tiveram\s+compra|efetuaram\s+compra)\b", p)
         or re.search(r"\bsem\s+compras?\b", p)
         or re.search(r"\bnao\s+tiveram\s+vendas\b", p)
     )
-    menciona_mes = bool(re.search(
-        r"\b(?:(?:nesse|neste|esse|este|no|do|durante o)\s+)?mes(?:\s+(?:atual|corrente))?\b", p
-    ))
-    return pede_lista and sem_compra and menciona_mes
+    menciona_mes = bool(re.search(r"\b(?:mes|janeiro|fevereiro|marco|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\b", p))
+    # Também aceita pedidos telegráficos como "cliente do departamento X que não comprou em 10/2026".
+    return sem_compra and menciona_mes and (pede_lista or re.search(r"\bclientes?\b", p))
+
+
+def _extrair_periodo_consulta_sem_compra(pergunta, agora):
+    """Extrai mês explícito (MM/AAAA ou nome do mês) ou usa o mês atual."""
+    texto = normalizar(str(pergunta or ""))
+    m = re.search(r"\b(0?[1-9]|1[0-2])\s*[/.-]\s*((?:19|20)\d{2})\b", texto)
+    if m:
+        ano, mes = int(m.group(2)), int(m.group(1))
+        return pd.Timestamp(ano, mes, 1)
+    meses = {
+        "janeiro": 1, "fevereiro": 2, "marco": 3, "abril": 4, "maio": 5, "junho": 6,
+        "julho": 7, "agosto": 8, "setembro": 9, "outubro": 10, "novembro": 11, "dezembro": 12,
+    }
+    for nome, numero in meses.items():
+        if re.search(rf"\b{nome}\b", texto):
+            ano_m = re.search(r"\b(?:19|20)\d{2}\b", texto)
+            ano = int(ano_m.group(0)) if ano_m else int(agora.year)
+            return pd.Timestamp(ano, numero, 1)
+    return pd.Timestamp(agora.year, agora.month, 1)
+
+
+def _extrair_departamento_consulta(pergunta):
+    """Extrai valor textual após 'departamento' da pergunta, sem enviar esse valor à IA."""
+    texto = str(pergunta or "")
+    m = re.search(
+        r"\bdepartamento\s+(?:de\s+|do\s+|da\s+)?(.+?)(?=\s+(?:que|com|sem|no\s+mes|neste\s+mes|em\s+\d{1,2}\s*[/.-]\s*\d{4}|\d{1,2}\s*[/.-]\s*\d{4})\b|$)",
+        texto, flags=re.IGNORECASE,
+    )
+    if not m:
+        return None
+    valor = m.group(1).strip(" \t\r\n,.;:!?\"'“”")
+    return valor or None
 
 
 def _saida_clientes_sem_compra_mes(quadro, pergunta):
-    """Calcula localmente clientes históricos sem compra registrada no mês corrente.
-
-    A consulta só conclui uma lista quando há ao menos um registro de vendas no mês,
-    usado como evidência mínima de que o período está presente na base recebida.
-    Não envia nomes de clientes para o modelo generativo.
-    """
+    """Calcula localmente clientes históricos sem compra no mês/perímetro solicitado."""
     if not _detectar_consulta_clientes_sem_compra_mes(pergunta):
         return None
 
     agora = pd.Timestamp(datetime.now().date())
-    inicio_mes = pd.Timestamp(agora.year, agora.month, 1)
+    inicio_mes = _extrair_periodo_consulta_sem_compra(pergunta, agora)
+    fim_mes = inicio_mes + pd.offsets.MonthBegin(1)
+    # Para meses futuros, não concluir ausência de compras.
+    data_limite = min(agora, fim_mes - pd.Timedelta(days=1))
     mes_rotulo = inicio_mes.strftime("%m/%Y")
-    limite_rotulo = agora.strftime("%d/%m/%Y")
+    departamento_pedido = _extrair_departamento_consulta(pergunta)
     detalhes = {
         "rota": "clientes_sem_compra_mes",
         "mes_considerado": mes_rotulo,
-        "data_limite": limite_rotulo,
+        "departamento_filtrado": bool(departamento_pedido),
         "calculo_local": True,
         "nomes_enviados_a_ia": False,
     }
@@ -2530,133 +2554,114 @@ def _saida_clientes_sem_compra_mes(quadro, pergunta):
             "resposta": mensagem,
             "resposta_segura": "Consulta de clientes sem compra calculada localmente.",
             "detalhes": detalhes_retorno,
-            # Memória deliberadamente sem nomes nem lista de clientes.
             "memoria": {
-                "pergunta": f"Clientes sem compra registrada no mês {mes_rotulo}",
+                "pergunta": f"Clientes sem compra registrada em {mes_rotulo}",
                 "consultas": [],
                 "resposta": "A lista foi calculada localmente; identidades não foram guardadas na memória da IA.",
             },
         }
 
     if not quadro.cols.get("cliente"):
-        return retorno(
-            "Não consigo listar esses clientes porque a base recebida não tem uma coluna de cliente reconhecida.",
-            "coluna_cliente_ausente",
-        )
+        return retorno("Não consigo listar esses clientes porque a base recebida não tem uma coluna de cliente reconhecida.", "coluna_cliente_ausente")
     if not quadro.tem_data:
-        return retorno(
-            "Não consigo confirmar quem não comprou neste mês porque a base recebida não tem uma coluna de data de venda válida.",
-            "coluna_data_ausente",
-        )
+        return retorno("Não consigo confirmar quem não comprou porque a base recebida não tem uma coluna de data de venda válida.", "coluna_data_ausente")
+    if departamento_pedido and not quadro.cols.get("departamento"):
+        return retorno("Não consigo aplicar esse filtro porque a base recebida não tem uma coluna 'Departamento' reconhecida.", "coluna_departamento_ausente")
+    if inicio_mes > agora:
+        return retorno(f"O mês {mes_rotulo} ainda não começou. Não é possível listar clientes que não compraram nesse período.", "periodo_futuro")
 
     coluna_cliente = quadro.coluna("cliente")
     datas = pd.to_datetime(quadro.tab["d"], errors="coerce")
-    ate_hoje = datas.notna() & (datas <= agora)
-    if not ate_hoje.any():
-        return retorno(
-            f"Não consigo verificar compras em {mes_rotulo}: a base não contém datas de venda válidas até {limite_rotulo}.",
-            "datas_insuficientes",
-        )
+    ate_limite = datas.notna() & (datas <= data_limite)
+    if not ate_limite.any():
+        return retorno(f"Não consigo verificar compras em {mes_rotulo}: a base não contém datas de venda válidas até {data_limite.strftime('%d/%m/%Y')}.", "datas_insuficientes")
 
-    ultima_data = datas.loc[ate_hoje].max()
-    if ultima_data < inicio_mes:
-        return retorno(
-            f"Não consigo identificar os clientes sem compra em {mes_rotulo}, porque os dados de vendas recebidos vão somente até {ultima_data.strftime('%d/%m/%Y')}. Atualize a base com os registros deste mês e tente novamente.",
-            "base_desatualizada",
-        )
-
-    no_mes = datas.ge(inicio_mes) & datas.le(agora)
+    # Período alvo inclui somente datas do mês pedido e nunca ultrapassa a data atual.
+    no_mes = datas.ge(inicio_mes) & datas.le(data_limite)
     if not no_mes.any():
-        return retorno(
-            f"A base não contém registros de venda entre {inicio_mes.strftime('%d/%m/%Y')} e {limite_rotulo}. Sem registros deste mês, não é seguro concluir que os clientes não compraram; confirme se a base está atualizada.",
-            "sem_registros_no_mes",
-        )
+        ultima_data = datas.loc[ate_limite].max()
+        if ultima_data < inicio_mes:
+            return retorno(f"Não consigo identificar os clientes sem compra em {mes_rotulo}, porque os dados recebidos vão somente até {ultima_data.strftime('%d/%m/%Y')}. Atualize a base com os registros desse período.", "base_desatualizada")
+        return retorno(f"A base não contém registros de venda em {mes_rotulo} até {data_limite.strftime('%d/%m/%Y')}. Sem registros do período, não é seguro concluir que clientes não compraram; confirme se a base está atualizada.", "sem_registros_no_mes")
+
+    universo = ate_limite.copy()
+    if departamento_pedido:
+        coluna_departamento = quadro.coluna("departamento")
+        valores_departamento = quadro.tab[coluna_departamento].astype(str).str.strip()
+        alvo = normalizar(departamento_pedido)
+        mascara_depto = valores_departamento.map(normalizar).eq(alvo)
+        if not mascara_depto.any():
+            # Não confundir a ausência do valor com uma solicitação para identificar um gerente.
+            valores_disponiveis = sorted({str(v).strip() for v in quadro._df[quadro.cols["departamento"]].dropna().tolist() if str(v).strip()})
+            amostra = ", ".join(valores_disponiveis[:15])
+            sufixo = f" Valores encontrados na base: {amostra}." if amostra else " A coluna não possui valores identificáveis."
+            return retorno(f"Não encontrei o departamento '{departamento_pedido}' na coluna Departamento.{sufixo}", "departamento_nao_encontrado")
+        universo &= mascara_depto
+        no_mes &= mascara_depto
 
     def nome_valido(valor):
-        nome = str(valor or "").strip()
-        chave = normalizar(nome)
-        return bool(chave) and chave not in {
-            "nan", "none", "null", "(sem informacao)", "(nao informado)", "(sem informação)"
-        }
+        chave = normalizar(str(valor or "").strip())
+        return bool(chave) and chave not in {"nan", "none", "null", "(sem informacao)", "(nao informado)"}
 
     nomes_historicos = {}
-    for nome in quadro.tab.loc[ate_hoje, coluna_cliente].tolist():
+    for nome in quadro.tab.loc[universo, coluna_cliente].tolist():
         if not nome_valido(nome):
             continue
+        nome = str(nome).strip()
         chave = normalizar(nome)
         existente = nomes_historicos.get(chave)
-        nome = str(nome).strip()
         if existente is None or (len(nome), nome.casefold()) < (len(existente), existente.casefold()):
             nomes_historicos[chave] = nome
 
-    if not nomes_historicos:
-        return retorno(
-            "Não encontrei nomes de clientes identificáveis nas vendas com data válida até o momento.",
-            "clientes_nao_identificados",
-        )
-
     compraram_no_mes = {
-        normalizar(str(nome).strip())
-        for nome in quadro.tab.loc[no_mes, coluna_cliente].tolist()
+        normalizar(str(nome).strip()) for nome in quadro.tab.loc[no_mes, coluna_cliente].tolist()
         if nome_valido(nome)
     }
-    sem_compra = sorted(
-        (nome for chave, nome in nomes_historicos.items() if chave not in compraram_no_mes),
-        key=lambda nome: normalizar(nome),
-    )
-    data_base = min(ultima_data, agora).strftime("%d/%m/%Y")
-    detalhes.update({
-        "status": "calculado",
-        "clientes_com_historico": len(nomes_historicos),
-        "clientes_sem_compra": len(sem_compra),
-        "considerar_registros_ate": data_base,
-    })
+    sem_compra = sorted((nome for chave, nome in nomes_historicos.items() if chave not in compraram_no_mes), key=normalizar)
+    data_base = data_limite.strftime("%d/%m/%Y")
+    detalhes.update({"status": "calculado", "clientes_com_historico": len(nomes_historicos), "clientes_sem_compra": len(sem_compra), "considerar_registros_ate": data_base})
+    rotulo_depto = f" do departamento '{departamento_pedido}'" if departamento_pedido else ""
 
     if not sem_compra:
-        return retorno(
-            f"Todos os clientes identificados no histórico têm ao menos uma compra registrada em {mes_rotulo}, considerando os dados até {data_base}.",
-            "todos_compraram_no_mes",
-        )
+        return retorno(f"Todos os clientes identificados{rotulo_depto} têm ao menos uma compra registrada em {mes_rotulo}, considerando os dados até {data_base}.", "todos_compraram_no_mes")
 
     limite_lista = 200
     exibidos = sem_compra[:limite_lista]
     linhas = "\n".join(f"- {nome}" for nome in exibidos)
-    resposta = (
-        f"Considerando os registros de vendas em {mes_rotulo} até {data_base}, "
-        f"estes {len(sem_compra)} clientes do histórico não têm compra registrada neste mês:\n\n{linhas}"
-    )
+    resposta = f"Considerando os registros de vendas{rotulo_depto} em {mes_rotulo} até {data_base}, estes {len(sem_compra)} clientes do histórico não têm compra registrada no período:\n\n{linhas}"
     if len(sem_compra) > limite_lista:
-        resposta += (
-            f"\n\nExibi os primeiros {limite_lista} de {len(sem_compra)} clientes para manter a resposta legível."
-        )
-    resposta += (
-        "\n\nObservação: a lista considera os clientes presentes no histórico de vendas recebido e "
-        "os registros de compra disponíveis até a data indicada."
-    )
+        resposta += f"\n\nExibi os primeiros {limite_lista} de {len(sem_compra)} clientes para manter a resposta legível."
+    resposta += "\n\nA lista considera os clientes presentes no histórico recebido e as vendas registradas até a data indicada."
     return retorno(resposta, "calculado")
 
-
 def processar_pergunta(df, cols, pergunta, mapa, historico, gerar, etapa=None):
-
     """Planeja -> executa localmente -> responde.
-
     `gerar(prompt, sistema, json_mode)` faz a chamada ao modelo (injetada para permitir testes).
-
     `etapa(texto)` é opcional e informa o andamento à interface.
-
     Retorna dict com: resposta (nomes reais), resposta_segura, detalhes, memoria.
-
     """
-
     aviso_etapa = etapa or (lambda _t: None)
-
+    # Validação das entradas antes de qualquer processamento ou chamada à IA.
+    if not isinstance(pergunta, str) or not pergunta.strip():
+        raise ValueError("A pergunta está vazia.")
+    pergunta = pergunta.strip()
+    if len(pergunta) > MAX_CHARS_PERGUNTA:
+        raise ValueError(f"A pergunta é longa demais (máximo de {MAX_CHARS_PERGUNTA} caracteres).")
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        raise ValueError("A base de vendas está vazia ou não é um DataFrame.")
+    if not isinstance(cols, dict) or cols.get("valor") not in df.columns:
+        raise ValueError("A coluna de valor não foi localizada na base.")
+    if not isinstance(mapa, dict):
+        raise TypeError("O mapa de pseudônimos deve ser um dicionário.")
+    if not callable(gerar):
+        raise TypeError("O parâmetro 'gerar' deve ser uma função.")
+    historico = historico if isinstance(historico, list) else []
     quadro = Quadro(df, cols)
     # Esta pergunta exige comparar o universo de clientes com as vendas do mês;
     # não cabe em um filtro simples de consulta. Resolva localmente antes do planejador.
     consulta_clientes_mes = _saida_clientes_sem_compra_mes(quadro, pergunta)
     if consulta_clientes_mes is not None:
         return consulta_clientes_mes
-
     # Correspondência aproximada acontece antes das validações e da anonimização,
     # sempre na máquina local e somente contra valores categóricos da base.
     pergunta_corrigida, correcoes_fuzzy, sugestao_fuzzy, meta_sugestao_fuzzy = corrigir_termos_similares(pergunta, quadro)
@@ -2676,7 +2681,6 @@ def processar_pergunta(df, cols, pergunta, mapa, historico, gerar, etapa=None):
             },
             "memoria": None,
         }
-
     # Se o usuário pesquisou explicitamente um nome entre aspas e ele não existe
     # exatamente na dimensão de clientes, interromper antes de chamar o Gemini.
     # A interface reconhece plano vazio/resultado inválido e limpa memória e pseudônimos.
@@ -2688,15 +2692,12 @@ def processar_pergunta(df, cols, pergunta, mapa, historico, gerar, etapa=None):
             "detalhes": {"rota": "validacao_local", "plano": [], "avisos": [], "resultados": []},
             "memoria": None,
         }
-
     # Os valores reais encontrados nunca são enviados ao Gemini: a pergunta corrigida
     # passa em seguida pela rotina normal de pseudonimização.
     pergunta_segura, _encontrados = anonimizar_pergunta(
         pergunta_corrigida, nomes_para_anonimizar(quadro), mapa
     )
-
     esquema = montar_esquema(quadro)
-
     # Rota rápida: perguntas inequívocas de total geral são calculadas localmente.
     # A IA continua sendo consultada para redigir a resposta, mas economizamos a chamada
     # de planejamento. Não há base estática, cache de resultados nem reutilização de histórico.
@@ -2721,53 +2722,31 @@ def processar_pergunta(df, cols, pergunta, mapa, historico, gerar, etapa=None):
             "plano": consultas, "avisos": avisos,
             "correcoes_automaticas": len(correcoes_fuzzy),
         }
-
-    detalhes = {
+    detalhes.update({
         "pergunta_enviada": pergunta_segura, "plano": consultas, "avisos": avisos,
         "correcoes_automaticas": len(correcoes_fuzzy),
         "termos_corrigidos": list(correcoes_fuzzy),
-    }
-
+    })
     if not consultas:
-
         texto = esclarecimento or (
-
             "Não consegui identificar quais dados consultar para essa pergunta com as colunas disponíveis. "
-
             + " ".join(avisos)
-
         ).strip()
-
         return {
-
             "resposta": desanonimizar(texto, mapa), "resposta_segura": texto, "detalhes": detalhes,
-
             "memoria": {"pergunta": pergunta_segura, "consultas": [], "resposta": texto[:700]},
-
         }
-
     # Execução local (o código fornece os dados).
-
     aviso_etapa("Consultando os dados...")
-
     resultados, restante = [], MAX_LINHAS_TOTAIS
-
     for consulta in consultas:
-
         if restante <= 0:
-
             avisos.append("Limite total de linhas atingido; algumas consultas não foram executadas.")
-
             break
-
         resultado = executar_consulta(quadro, consulta, mapa, limite_maximo=restante)
-
         restante -= resultado.get("linhas_retornadas", 0)
-
         resultados.append(resultado)
-
     detalhes["resultados"] = resultados
-
     # Se todas as consultas retornarem zero registros, não chamar o Gemini
     # para evitar uma resposta especulativa; a interface limpará o contexto.
     consultas_sem_registros = _todos_resultados_vazios(resultados)
@@ -2779,47 +2758,37 @@ def processar_pergunta(df, cols, pergunta, mapa, historico, gerar, etapa=None):
             "detalhes": detalhes,
             "memoria": None,
         }
-
     # Requisição 2: a IA responde com os dados fornecidos.
-
     aviso_etapa("Escrevendo a resposta...")
-
     texto = gerar(montar_prompt_resposta(pergunta_segura, resultados, avisos, esquema), INSTRUCOES_IA, False)
-
     return {
-
         "resposta": desanonimizar(texto, mapa), "resposta_segura": texto, "detalhes": detalhes,
-
         "memoria": {
-
             "pergunta": pergunta_segura,
-
             "consultas": [
-
                 {"descricao": c["descricao"], "agrupar_por": c["agrupar_por"], "metricas": c["metricas"],
-
                  "filtros": c["filtros"], "periodo": c["periodo"], "somente_ultima_data": c["somente_ultima_data"]}
-
                 for c in consultas
-
             ],
-
             "resposta": texto[:700],
-
         },
-
     }
+
+def _confirmacao_curta(normalizada):
+    """'sim' / 'sim pode' valem como confirmação; 'sim, mas na verdade quero outro' não."""
+    palavras = re.findall(r"\w+", normalizada)
+    contra = {"mas", "porem", "contudo", "outro", "outra", "verdade", "nao"}
+    return bool(palavras) and palavras[0] == "sim" and len(palavras) <= 4 and not contra.intersection(palavras)
+
 
 def resolver_confirmacao_validacao(resposta, pendente):
     """Resolve a resposta a uma sugestão do corretor, sem chamar o modelo.
-
     Retorna ação ``confirmada``, ``recusada`` ou ``nova_pergunta``.
     """
     texto = str(resposta or "").strip()
     normalizada = normalizar(texto).strip(" .!?;:,")
     if not isinstance(pendente, dict):
         return {"acao": "nova_pergunta", "pergunta": texto, "correcoes": []}
-
     opcoes = [str(x) for x in (pendente.get("opcoes") or [pendente.get("candidato")]) if x]
     escolha = None
     afirmativas = {
@@ -2830,11 +2799,10 @@ def resolver_confirmacao_validacao(resposta, pendente):
         "nao", "nao e esse", "nao e essa", "nao e isso", "negativo", "errado",
         "errada", "nenhum", "nenhuma", "outro", "outra",
     }
-
     if not pendente.get("ambigua") and len(opcoes) == 1 and (
         normalizada in afirmativas
         or normalizada == normalizar(opcoes[0]).strip(" .!?;:,")
-        or normalizada.startswith("sim ")
+        or _confirmacao_curta(normalizada)
     ):
         escolha = opcoes[0]
     elif pendente.get("ambigua"):
@@ -2846,7 +2814,6 @@ def resolver_confirmacao_validacao(resposta, pendente):
             numero_opcao = re.fullmatch(r"(?:opcao\s*)?([1-3])", normalizada)
             if numero_opcao and int(numero_opcao.group(1)) <= len(opcoes):
                 escolha = opcoes[int(numero_opcao.group(1)) - 1]
-
     if escolha:
         termo = str(pendente.get("termo", ""))
         pergunta_original = str(pendente.get("pergunta_original", ""))
@@ -2859,10 +2826,8 @@ def resolver_confirmacao_validacao(resposta, pendente):
             "pergunta": pergunta_corrigida,
             "correcoes": [(termo, escolha)] if termo else [],
         }
-
-    if normalizada in negativas or normalizada.startswith("nao "):
+    if normalizada in negativas or (normalizada.startswith("nao ") and len(normalizada.split()) <= 4):
         return {"acao": "recusada", "pergunta": None, "correcoes": []}
-
     return {"acao": "nova_pergunta", "pergunta": texto, "correcoes": []}
 
 
@@ -3127,7 +3092,7 @@ def exibir_assistente_ia(
                 with entrada_col:
                     pergunta_digitada = st.text_input(
                         "Pergunta ao assistente", placeholder="Digite sua pergunta...",
-                        label_visibility="collapsed", key=f"entrada_texto_ia_{sufixo}",
+                        label_visibility="collapsed", key=f"entrada_texto_ia_{sufixo}", max_chars=MAX_CHARS_PERGUNTA,
                     )
                 with enviar_col:
                     enviar = st.form_submit_button("➤", use_container_width=True)
@@ -3175,6 +3140,9 @@ def exibir_assistente_ia(
     if not pergunta:
         return
 
+    if len(pergunta) > MAX_CHARS_PERGUNTA:
+        st.warning(f"A pergunta tem {len(pergunta)} caracteres; o máximo é {MAX_CHARS_PERGUNTA}. Resuma e envie novamente.")
+        return
     # O corretor valida somente nomes/termos da base; não corrige gramática.
     pergunta_exibida = pergunta
     correcoes_confirmadas = []
@@ -3200,6 +3168,9 @@ def exibir_assistente_ia(
             # Outra pergunta foi digitada: abandona a confirmação anterior.
             st.session_state.pop(chave_pendente_validacao, None)
 
+    if not isinstance(df_vendas, pd.DataFrame):
+        st.error("O assistente esperava um DataFrame do pandas com a base de vendas.")
+        return
     if df_vendas.empty:
 
         st.warning("A base completa não contém registros para consulta.")
@@ -3214,6 +3185,9 @@ def exibir_assistente_ia(
 
         return
 
+    if colunas_extras is not None and not isinstance(colunas_extras, dict):
+        st.error("'colunas_extras' deve ser um dicionário {dimensão: nome da coluna}.")
+        return
     explicitas = {
 
         "cliente": coluna_cliente, "produto": coluna_produto, "vendedor": coluna_vendedor,
