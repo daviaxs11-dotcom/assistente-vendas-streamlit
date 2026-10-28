@@ -31,6 +31,7 @@
 # Modelo (opcional): variável de ambiente GEMINI_MODEL.
 
 import json
+import difflib
 
 import os
 
@@ -859,6 +860,146 @@ def nomes_para_anonimizar(quadro):
             valores = quadro._df[origem].dropna().astype(str).str.strip().unique()
             saida.setdefault(prefixo, set()).update(valores)
     return saida
+
+def corrigir_termos_similares(pergunta, quadro, limite=0.50, margem=0.06):
+    """Compara sequências de caracteres da pergunta com valores locais da base.
+
+    Os espaços são ignorados no cálculo. Acima de 50% (inclusive) substitui a
+    sequência pelo valor canônico da base; abaixo de 50%, quando existe alguma
+    sobreposição real de caracteres, devolve uma sugestão para confirmação.
+    Similaridade/overlap de 0% não gera mensagem de sugestão.
+
+    Retorna (pergunta_corrigida, correcoes, sugestao). Dados reais permanecem locais
+    e só são pseudonimizados por anonimizar_pergunta antes de qualquer chamada ao Gemini.
+    """
+    texto = str(pergunta or "")
+    if not texto.strip():
+        return texto, [], None
+
+    candidatos = {
+        str(v).strip()
+        for valores in nomes_para_anonimizar(quadro).values()
+        for v in valores
+        if str(v).strip() and len(str(v).strip()) >= 2
+    }
+    for dim in DIMENSOES_TEXTO:
+        coluna = quadro.cols.get(dim)
+        if coluna and coluna in quadro._df.columns:
+            candidatos.update(
+                str(v).strip() for v in quadro._df[coluna].dropna().unique()
+                if str(v).strip() and len(str(v).strip()) >= 2
+            )
+    if not candidatos:
+        return texto, [], None
+
+    def compacto(valor):
+        # normalizar remove acentos/caixa; em seguida removemos todos os espaços.
+        return re.sub(r"\s+", "", normalizar(str(valor)))
+
+    normalizados = {}
+    for valor in candidatos:
+        nv = compacto(valor)
+        if nv:
+            normalizados.setdefault(nv, valor)
+
+    padrao = re.compile(r"[\wÀ-ÖØ-öø-ÿ]+(?:[-./][\wÀ-ÖØ-öø-ÿ]+)*", re.UNICODE)
+    tokens = list(padrao.finditer(texto))
+    if not tokens:
+        return texto, [], None
+
+    # Palavras funcionais/indicadores não devem, sozinhas, ser confundidas com
+    # entidades. O trecho candidato pode conter várias palavras e é comparado
+    # como uma sequência única, sem espaços.
+    ignorar = {
+        "qual", "quais", "foi", "foram", "e", "o", "a", "os", "as", "um", "uma",
+        "de", "da", "do", "das", "dos", "em", "no", "na", "nos", "nas", "por",
+        "para", "com", "quanto", "quantos", "quantas", "me", "mostre", "traga",
+        "faturamento", "venda", "vendas", "quantidade", "vendida", "vendido", "total",
+        "valor", "media", "médio", "medio", "pedido", "pedidos", "cliente", "produto",
+        "sku", "vendedor", "representante", "empresa", "segmento", "mes", "mês", "ano",
+    }
+    spans = []
+    for i, tok in enumerate(tokens):
+        for quantidade in range(1, min(6, len(tokens) - i) + 1):
+            fim = i + quantidade - 1
+            a, b = tok.start(), tokens[fim].end()
+            trecho = texto[a:b]
+            partes = [normalizar(x.group()) for x in tokens[i:fim + 1]]
+            if not any(parte not in ignorar for parte in partes):
+                continue
+            alvo = compacto(trecho)
+            if len(alvo) < 4:
+                continue
+            spans.append((a, b, trecho, alvo))
+
+    if not spans:
+        return texto, [], None
+
+    # Evitar que uma palavra dentro de um nome composto seja processada duas vezes:
+    # selecionamos o melhor candidato global, dando preferência a maior confiança.
+    pontuacoes = []
+    for a, b, trecho, alvo in spans:
+        for candidato_norm, candidato_original in normalizados.items():
+            # Códigos com letras e números só comparam contra códigos do mesmo tamanho.
+            alfanumerico = bool(re.search(r"[a-z]", alvo) and re.search(r"\d", alvo))
+            if alfanumerico and (len(candidato_norm) != len(alvo) or not re.search(r"\d", candidato_norm)):
+                continue
+            ratio = difflib.SequenceMatcher(None, alvo, candidato_norm).ratio()
+            # Complemento de cobertura: mede se há uma sequência de caracteres comum.
+            bloco = difflib.SequenceMatcher(None, alvo, candidato_norm).find_longest_match(0, len(alvo), 0, len(candidato_norm))
+            cobertura = bloco.size / max(len(alvo), len(candidato_norm), 1)
+            # Um overlap de 0% é ausência total de informação compartilhada.
+            if bloco.size == 0:
+                continue
+            pontuacoes.append({
+                "a": a, "b": b, "trecho": trecho, "alvo": alvo,
+                "candidato_norm": candidato_norm, "candidato": candidato_original,
+                "ratio": ratio, "cobertura": cobertura, "alfanumerico": alfanumerico,
+            })
+
+    if not pontuacoes:
+        return texto, [], None
+
+    # Para cada trecho, escolher a melhor palavra/expressão da base. Depois selecionar
+    # a combinação de maior similaridade; em empate, preferir o trecho mais curto,
+    # que normalmente isola o nome em uma pergunta completa.
+    melhores_por_trecho = {}
+    for item in pontuacoes:
+        chave = (item["a"], item["b"])
+        anterior = melhores_por_trecho.get(chave)
+        if anterior is None or item["ratio"] > anterior["ratio"]:
+            melhores_por_trecho[chave] = item
+    melhores = sorted(
+        melhores_por_trecho.values(),
+        key=lambda x: (x["ratio"], -len(x["trecho"])), reverse=True
+    )
+    melhor = melhores[0]
+    segundo = next((x for x in melhores[1:] if x["candidato_norm"] != melhor["candidato_norm"]), None)
+
+    # Só processar uma correspondência se não houver concorrente quase tão provável.
+    ambigua = bool(segundo and melhor["ratio"] - segundo["ratio"] < margem
+                   and segundo["candidato_norm"] != melhor["candidato_norm"])
+    if melhor["ratio"] >= limite and not ambigua:
+        corrigida = texto[:melhor["a"]] + melhor["candidato"] + texto[melhor["b"]:]
+        return corrigida, [(melhor["trecho"], melhor["candidato"])], None
+
+    # Se existe correspondência parcial, mas ela fica abaixo de 50%, pedir confirmação.
+    # Similaridade 0% não chega aqui e não dispara a mensagem padrão.
+    if melhor["ratio"] > 0 and melhor["ratio"] < limite:
+        sugestao = (
+            f'Em "{melhor["trecho"]}" você quis dizer "{melhor["candidato"]}"?'
+        )
+        return texto, [], sugestao
+
+    # Correspondência ambígua acima do limite também não deve ser escolhida às cegas.
+    if ambigua:
+        sugestao = (
+            f'Em "{melhor["trecho"]}" você quis dizer "{melhor["candidato"]}"?'
+        )
+        return texto, [], sugestao
+
+    return texto, [], None
+
 
 def montar_esquema(quadro):
 
@@ -1769,11 +1910,25 @@ def processar_pergunta(df, cols, pergunta, mapa, historico, gerar, etapa=None):
     aviso_etapa = etapa or (lambda _t: None)
 
     quadro = Quadro(df, cols)
+    # Correspondência aproximada acontece antes das validações e da anonimização,
+    # sempre na máquina local e somente contra valores categóricos da base.
+    pergunta_corrigida, correcoes_fuzzy, sugestao_fuzzy = corrigir_termos_similares(pergunta, quadro)
+    if sugestao_fuzzy:
+        return {
+            "resposta": sugestao_fuzzy,
+            "resposta_segura": sugestao_fuzzy,
+            "detalhes": {
+                "rota": "validacao_local_similaridade",
+                "plano": [], "avisos": [], "resultados": [],
+                "correcoes_automaticas": 0,
+            },
+            "memoria": None,
+        }
 
     # Se o usuário pesquisou explicitamente um nome entre aspas e ele não existe
     # exatamente na dimensão de clientes, interromper antes de chamar o Gemini.
     # A interface reconhece plano vazio/resultado inválido e limpa memória e pseudônimos.
-    nome_nao_encontrado = _termo_pesquisa_nome_nao_encontrado(pergunta, quadro)
+    nome_nao_encontrado = _termo_pesquisa_nome_nao_encontrado(pergunta_corrigida, quadro)
     if nome_nao_encontrado is not None:
         return {
             "resposta": "nao foram encontrados registros",
@@ -1782,7 +1937,11 @@ def processar_pergunta(df, cols, pergunta, mapa, historico, gerar, etapa=None):
             "memoria": None,
         }
 
-    pergunta_segura, _encontrados = anonimizar_pergunta(pergunta, nomes_para_anonimizar(quadro), mapa)
+    # Os valores reais encontrados nunca são enviados ao Gemini: a pergunta corrigida
+    # passa em seguida pela rotina normal de pseudonimização.
+    pergunta_segura, _encontrados = anonimizar_pergunta(
+        pergunta_corrigida, nomes_para_anonimizar(quadro), mapa
+    )
 
     esquema = montar_esquema(quadro)
 
@@ -1798,15 +1957,23 @@ def processar_pergunta(df, cols, pergunta, mapa, historico, gerar, etapa=None):
         detalhes = {
             "rota": "rapida_local", "pergunta_enviada": pergunta_segura,
             "plano": consultas, "avisos": avisos,
+            "correcoes_automaticas": len(correcoes_fuzzy),
         }
     else:
         # Rota completa: a IA planeja a consulta com base na pergunta atual.
         aviso_etapa("Entendendo a pergunta...")
         texto_plano = gerar(montar_prompt_planejador(pergunta_segura, esquema, historico), INSTRUCOES_PLANEJADOR, True)
         consultas, avisos, esclarecimento = validar_plano(_extrair_json(texto_plano), cols, quadro.tem_data)
-        detalhes = {"rota": "planejamento_ia", "pergunta_enviada": pergunta_segura, "plano": consultas, "avisos": avisos}
+        detalhes = {
+            "rota": "planejamento_ia", "pergunta_enviada": pergunta_segura,
+            "plano": consultas, "avisos": avisos,
+            "correcoes_automaticas": len(correcoes_fuzzy),
+        }
 
-    detalhes = {"pergunta_enviada": pergunta_segura, "plano": consultas, "avisos": avisos}
+    detalhes = {
+        "pergunta_enviada": pergunta_segura, "plano": consultas, "avisos": avisos,
+        "correcoes_automaticas": len(correcoes_fuzzy),
+    }
 
     if not consultas:
 
