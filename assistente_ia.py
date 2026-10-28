@@ -861,55 +861,73 @@ def nomes_para_anonimizar(quadro):
             saida.setdefault(prefixo, set()).update(valores)
     return saida
 
+# Cache local de candidatos normalizados. A lógica de seleção abaixo preserva os critérios
+# da versão completa; o cache apenas evita reconstruir/normalizar os nomes em cada pergunta.
+_CACHE_CANDIDATOS_FUZZY = {}
+_LIMITE_CACHE_CANDIDATOS_FUZZY = 8
+
+
 def corrigir_termos_similares(pergunta, quadro, limite=0.50, margem=0.06):
-    """Compara sequências de caracteres da pergunta com valores locais da base.
+    """Compara sequências da pergunta com valores da base, ignorando espaços.
 
-    Os espaços são ignorados no cálculo. Acima de 50% (inclusive) substitui a
-    sequência pelo valor canônico da base; abaixo de 50%, quando existe alguma
-    sobreposição real de caracteres, devolve uma sugestão para confirmação.
-    Similaridade/overlap de 0% não gera mensagem de sugestão.
-
-    Retorna (pergunta_corrigida, correcoes, sugestao). Dados reais permanecem locais
-    e só são pseudonimizados por anonimizar_pergunta antes de qualquer chamada ao Gemini.
+    Mantém a regra funcional original: correspondência >= 50% substitui pelo valor
+    canônico quando não ambígua; correspondência abaixo do limite sugere confirmação;
+    zero de sobreposição não gera sugestão. Dados reais só seguem para anonimização local.
     """
     texto = str(pergunta or "")
     if not texto.strip():
         return texto, [], None
 
-    candidatos = {
-        str(v).strip()
-        for valores in nomes_para_anonimizar(quadro).values()
-        for v in valores
-        if str(v).strip() and len(str(v).strip()) >= 2
-    }
-    for dim in DIMENSOES_TEXTO:
-        coluna = quadro.cols.get(dim)
-        if coluna and coluna in quadro._df.columns:
-            candidatos.update(
-                str(v).strip() for v in quadro._df[coluna].dropna().unique()
-                if str(v).strip() and len(str(v).strip()) >= 2
-            )
-    if not candidatos:
-        return texto, [], None
-
     def compacto(valor):
-        # normalizar remove acentos/caixa; em seguida removemos todos os espaços.
         return re.sub(r"\s+", "", normalizar(str(valor)))
 
-    normalizados = {}
-    for valor in candidatos:
-        nv = compacto(valor)
-        if nv:
-            normalizados.setdefault(nv, valor)
+    # Chave inclui a identidade do DataFrame e seu formato para evitar colisões simples.
+    chave_cache = (id(quadro._df), len(quadro._df), tuple(quadro._df.columns))
+    normalizados = _CACHE_CANDIDATOS_FUZZY.get(chave_cache)
+    if normalizados is None:
+        candidatos = {
+            str(v).strip()
+            for valores in nomes_para_anonimizar(quadro).values()
+            for v in valores
+            if str(v).strip() and len(str(v).strip()) >= 2
+        }
+        for dim in DIMENSOES_TEXTO:
+            coluna = quadro.cols.get(dim)
+            if coluna and coluna in quadro._df.columns:
+                candidatos.update(
+                    str(v).strip()
+                    for v in quadro._df[coluna].dropna().unique()
+                    if str(v).strip() and len(str(v).strip()) >= 2
+                )
+        normalizados_dict = {}
+        for valor in candidatos:
+            nv = compacto(valor)
+            if nv:
+                normalizados_dict.setdefault(nv, valor)
+        # Cada candidato é preparado uma única vez: caracteres e presença de dígitos
+        # são reutilizados em todas as perguntas, em vez de recalculados no loop interno.
+        registros = tuple(
+            (nv, original, frozenset(nv), bool(re.search(r"\d", nv)))
+            for nv, original in normalizados_dict.items()
+        )
+        indice_caracteres = {}
+        for idx, (nv, _original, caracteres, _tem_digito) in enumerate(registros):
+            for caractere in caracteres:
+                indice_caracteres.setdefault(caractere, set()).add(idx)
+        normalizados = (registros, indice_caracteres)
+        if len(_CACHE_CANDIDATOS_FUZZY) >= _LIMITE_CACHE_CANDIDATOS_FUZZY:
+            _CACHE_CANDIDATOS_FUZZY.clear()
+        _CACHE_CANDIDATOS_FUZZY[chave_cache] = normalizados
+
+    if not normalizados or not normalizados[0]:
+        return texto, [], None
+    registros, indice_caracteres = normalizados
 
     padrao = re.compile(r"[\wÀ-ÖØ-öø-ÿ]+(?:[-./][\wÀ-ÖØ-öø-ÿ]+)*", re.UNICODE)
     tokens = list(padrao.finditer(texto))
     if not tokens:
         return texto, [], None
 
-    # Palavras funcionais/indicadores não devem, sozinhas, ser confundidas com
-    # entidades. O trecho candidato pode conter várias palavras e é comparado
-    # como uma sequência única, sem espaços.
     ignorar = {
         "qual", "quais", "foi", "foram", "e", "o", "a", "os", "as", "um", "uma",
         "de", "da", "do", "das", "dos", "em", "no", "na", "nos", "nas", "por",
@@ -918,37 +936,45 @@ def corrigir_termos_similares(pergunta, quadro, limite=0.50, margem=0.06):
         "valor", "media", "médio", "medio", "pedido", "pedidos", "cliente", "produto",
         "sku", "vendedor", "representante", "empresa", "segmento", "mes", "mês", "ano",
     }
+
     spans = []
     for i, tok in enumerate(tokens):
+        # Mantém a janela de até 6 tokens da versão funcional.
         for quantidade in range(1, min(6, len(tokens) - i) + 1):
             fim = i + quantidade - 1
-            a, b = tok.start(), tokens[fim].end()
-            trecho = texto[a:b]
             partes = [normalizar(x.group()) for x in tokens[i:fim + 1]]
             if not any(parte not in ignorar for parte in partes):
                 continue
+            a, b = tok.start(), tokens[fim].end()
+            trecho = texto[a:b]
             alvo = compacto(trecho)
-            if len(alvo) < 4:
-                continue
-            spans.append((a, b, trecho, alvo))
+            if len(alvo) >= 4:
+                spans.append((a, b, trecho, alvo))
 
     if not spans:
         return texto, [], None
 
-    # Evitar que uma palavra dentro de um nome composto seja processada duas vezes:
-    # selecionamos o melhor candidato global, dando preferência a maior confiança.
     pontuacoes = []
     for a, b, trecho, alvo in spans:
-        for candidato_norm, candidato_original in normalizados.items():
-            # Códigos com letras e números só comparam contra códigos do mesmo tamanho.
-            alfanumerico = bool(re.search(r"[a-z]", alvo) and re.search(r"\d", alvo))
-            if alfanumerico and (len(candidato_norm) != len(alvo) or not re.search(r"\d", candidato_norm)):
+        alvo_chars = frozenset(alvo)
+        alfanumerico = bool(re.search(r"[a-z]", alvo) and re.search(r"\d", alvo))
+        # Índice invertido: só calcula similaridade para candidatos com ao menos
+        # um caractere em comum. Isso mantém o comportamento de zero sobreposição,
+        # mas evita varrer candidatos impossíveis para cada sequência da pergunta.
+        indices_candidatos = set()
+        for caractere in alvo_chars:
+            indices_candidatos.update(indice_caracteres.get(caractere, ()))
+        for idx in sorted(indices_candidatos):
+            candidato_norm, candidato_original, candidato_chars, candidato_tem_digito = registros[idx]
+            # Mantém a proteção de códigos alfanuméricos para não confundir BP500/BP5000.
+            if alfanumerico and (
+                len(candidato_norm) != len(alvo) or not candidato_tem_digito
+            ):
                 continue
-            ratio = difflib.SequenceMatcher(None, alvo, candidato_norm).ratio()
-            # Complemento de cobertura: mede se há uma sequência de caracteres comum.
-            bloco = difflib.SequenceMatcher(None, alvo, candidato_norm).find_longest_match(0, len(alvo), 0, len(candidato_norm))
+            matcher = difflib.SequenceMatcher(None, alvo, candidato_norm, autojunk=False)
+            ratio = matcher.ratio()
+            bloco = matcher.find_longest_match(0, len(alvo), 0, len(candidato_norm))
             cobertura = bloco.size / max(len(alvo), len(candidato_norm), 1)
-            # Um overlap de 0% é ausência total de informação compartilhada.
             if bloco.size == 0:
                 continue
             pontuacoes.append({
@@ -960,9 +986,6 @@ def corrigir_termos_similares(pergunta, quadro, limite=0.50, margem=0.06):
     if not pontuacoes:
         return texto, [], None
 
-    # Para cada trecho, escolher a melhor palavra/expressão da base. Depois selecionar
-    # a combinação de maior similaridade; em empate, preferir o trecho mais curto,
-    # que normalmente isola o nome em uma pergunta completa.
     melhores_por_trecho = {}
     for item in pontuacoes:
         chave = (item["a"], item["b"])
@@ -974,29 +997,20 @@ def corrigir_termos_similares(pergunta, quadro, limite=0.50, margem=0.06):
         key=lambda x: (x["ratio"], -len(x["trecho"])), reverse=True
     )
     melhor = melhores[0]
-    segundo = next((x for x in melhores[1:] if x["candidato_norm"] != melhor["candidato_norm"]), None)
+    segundo = next(
+        (x for x in melhores[1:] if x["candidato_norm"] != melhor["candidato_norm"]), None
+    )
+    ambigua = bool(
+        segundo and melhor["ratio"] - segundo["ratio"] < margem
+        and segundo["candidato_norm"] != melhor["candidato_norm"]
+    )
 
-    # Só processar uma correspondência se não houver concorrente quase tão provável.
-    ambigua = bool(segundo and melhor["ratio"] - segundo["ratio"] < margem
-                   and segundo["candidato_norm"] != melhor["candidato_norm"])
     if melhor["ratio"] >= limite and not ambigua:
         corrigida = texto[:melhor["a"]] + melhor["candidato"] + texto[melhor["b"]:]
         return corrigida, [(melhor["trecho"], melhor["candidato"])], None
 
-    # Se existe correspondência parcial, mas ela fica abaixo de 50%, pedir confirmação.
-    # Similaridade 0% não chega aqui e não dispara a mensagem padrão.
-    if melhor["ratio"] > 0 and melhor["ratio"] < limite:
-        sugestao = (
-            f'Em "{melhor["trecho"]}" você quis dizer "{melhor["candidato"]}"?'
-        )
-        return texto, [], sugestao
-
-    # Correspondência ambígua acima do limite também não deve ser escolhida às cegas.
-    if ambigua:
-        sugestao = (
-            f'Em "{melhor["trecho"]}" você quis dizer "{melhor["candidato"]}"?'
-        )
-        return texto, [], sugestao
+    if melhor["ratio"] > 0 and (melhor["ratio"] < limite or ambigua):
+        return texto, [], f'Em "{melhor["trecho"]}" você quis dizer "{melhor["candidato"]}"?'
 
     return texto, [], None
 
