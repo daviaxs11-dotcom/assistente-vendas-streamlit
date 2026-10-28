@@ -64,7 +64,7 @@ LIMITE_MAXIMO = 200          # máximo de linhas por consulta
 MAX_LINHAS_TOTAIS = 300      # máximo de linhas somando todas as consultas
 
 MAX_VALORES_LISTADOS = 40    # valores listados no esquema para dimensões pequenas
-MIN_REGISTROS_GRUPO_PRIVACIDADE = 0  # grupos menores não são enviados ao Gemini
+MIN_REGISTROS_GRUPO_PRIVACIDADE = 0  # bloqueia divulgação de grupos com menos de cinco registros
 
 TURNOS_HISTORICO = 4         # turnos anteriores enviados ao planejador
 
@@ -867,153 +867,337 @@ _CACHE_CANDIDATOS_FUZZY = {}
 _LIMITE_CACHE_CANDIDATOS_FUZZY = 8
 
 
-def corrigir_termos_similares(pergunta, quadro, limite=0.50, margem=0.06):
-    """Compara sequências da pergunta com valores da base, ignorando espaços.
+def corrigir_termos_similares(pergunta, quadro, limite=0.83, margem=0.07):
+    """Valida somente nomes/termos da base, sem corrigir gramática da pergunta.
 
-    Mantém a regra funcional original: correspondência >= 50% substitui pelo valor
-    canônico quando não ambígua; correspondência abaixo do limite sugere confirmação;
-    zero de sobreposição não gera sugestão. Dados reais só seguem para anonimização local.
+    Retorno: (pergunta_corrigida, correcoes, sugestao, metadados_sugestao).
+    Correspondências exatas são preservadas; erros fortes são corrigidos localmente;
+    casos plausíveis, porém incertos, pedem confirmação antes de consultar o Gemini.
     """
     texto = str(pergunta or "")
     if not texto.strip():
-        return texto, [], None
+        return texto, [], None, None
 
     def compacto(valor):
-        return re.sub(r"\s+", "", normalizar(str(valor)))
+        # Ignora caixa, acentos, espaços e pontuação para conferir nomes/códigos.
+        return re.sub(r"[^a-z0-9]", "", normalizar(str(valor)))
 
-    # Chave inclui a identidade do DataFrame e seu formato para evitar colisões simples.
-    chave_cache = (id(quadro._df), len(quadro._df), tuple(quadro._df.columns))
+    # Palavras funcionais da pergunta não devem ser interpretadas como nomes.
+    ignorar = {normalizar(x) for x in (
+        "qual", "quais", "foi", "foram", "e", "o", "a", "os", "as", "um", "uma",
+        "de", "da", "do", "das", "dos", "em", "no", "na", "nos", "nas", "por",
+        "para", "com", "quanto", "quantos", "quantas", "me", "mostre", "mostrar",
+        "traga", "ver", "veja", "analise", "analisar", "faturamento", "venda", "vendas",
+        "quantidade", "vendida", "vendido", "total", "valor", "media", "médio", "medio",
+        "pedido", "pedidos", "cliente", "clientes", "produto", "produtos", "sku", "vendedor",
+        "vendedores", "representante", "representantes", "empresa", "segmento", "mes", "mês",
+        "ano", "evolucao", "evolução", "maiores", "maior", "menores", "menor", "top",
+        "ultimos", "últimos", "ultimo", "último", "ultimas", "últimas", "última", "ultima",
+        "entre", "sobre", "dos", "das", "crescimento", "queda", "comparar", "comparacao",
+    )}
+
+    # Esses termos são rótulos da consulta, não o início de um nome, a menos que
+    # o usuário os repita no próprio nome (ex.: "cliente Cliente Exato").
+    rotulos_dimensao = {normalizar(x) for x in (
+        "cliente", "clientes", "produto", "produtos", "sku", "vendedor", "vendedores",
+        "representante", "representantes", "empresa", "empresas", "segmento", "segmentos",
+        "gerente", "gerentes", "departamento", "departamentos",
+    )}
+
+    # Monta um catálogo local de termos. O texto completo da base nunca sai daqui.
+    valores_por_dim = {}
+
+    def adicionar(dim, valor):
+        valor = str(valor).strip()
+        nv = compacto(valor)
+        if len(nv) >= 3:
+            valores_por_dim.setdefault(dim, set()).add(valor)
+
+    for dim in DIMENSOES_TEXTO:
+        coluna = quadro.cols.get(dim)
+        if coluna and coluna in quadro._df.columns:
+            for valor in quadro._df[coluna].dropna().astype(str).unique():
+                adicionar(dim, valor)
+
+    # Campos adicionais permitidos pelo assistente também podem ser validados localmente.
+    for dim, coluna in quadro.cols.get("_dinamicas", {}).items():
+        if coluna in quadro._df.columns:
+            for valor in quadro._df[coluna].dropna().astype(str).unique():
+                adicionar(dim, valor)
+
+    # Colunas bloqueadas continuam fora da consulta à IA, mas seus nomes podem ser
+    # usados somente na validação local, para que a pergunta seja pseudonimizada depois.
+    dimensoes_por_prefixo = {
+        "Cliente": {"cliente"},
+        "Vendedor": {"vendedor", "vendedor_cadastro"},
+        "Representante": {"representante"},
+        "Gerente": {"gerente_regiao"},
+        "Dado": {"__geral__"},
+    }
+    for prefixo, colunas in quadro.cols.get("_colunas_anonimizacao", {}).items():
+        dims_destino = dimensoes_por_prefixo.get(prefixo, {"__geral__"})
+        for coluna in colunas:
+            if coluna in quadro._df.columns:
+                for valor in quadro._df[coluna].dropna().astype(str).unique():
+                    for dim in dims_destino:
+                        adicionar(dim, valor)
+
+    if not valores_por_dim:
+        return texto, [], None, None
+
+    # A dica de dimensão mais próxima do termo limita candidatos: um nome de cliente
+    # não deve ser corrigido para um produto parecido quando a pergunta diz "cliente".
+    pistas_contexto = [
+        (r"\bclientes?\b|\bcompradores?\b", {"cliente"}),
+        (r"\bvendedores?\b", {"vendedor", "vendedor_cadastro"}),
+        (r"\brepresentantes?\b", {"representante", "vendedor"}),
+        (r"\b(?:sku|codigo|referencia)\b", {"sku", "produto"}),
+        (r"\b(?:produtos?|itens?|modelos?)\b", {"produto", "sku"}),
+        (r"\bsegmentos?\b", {"segmento"}),
+        (r"\bempresas?\b", {"empresa"}),
+        (r"\bdepartamentos?\b", {"departamento"}),
+        (r"\bgerentes?\b", {"gerente_regiao"}),
+        (r"\bstatus\s+(?:de\s+)?faturamento\b", {"status_faturamento"}),
+    ]
+    # Usa também o nome dos campos adicionais como pista contextual local.
+    for dim, coluna in quadro.cols.get("_dinamicas", {}).items():
+        nome_coluna = normalizar(coluna)
+        if len(nome_coluna) >= 4:
+            pistas_contexto.append((r"\b" + re.escape(nome_coluna) + r"\b", {dim}))
+
+    def dimensoes_contextuais(posicao):
+        trecho_anterior = normalizar(texto[max(0, posicao - 120):posicao])
+        encontradas = []
+        for padrao, dims in pistas_contexto:
+            for m in re.finditer(padrao, trecho_anterior):
+                encontradas.append((m.end(), dims))
+        if not encontradas:
+            return None
+        return max(encontradas, key=lambda item: item[0])[1]
+
+    # Um cache só é reutilizado se o catálogo de valores realmente não mudou.
+    assinatura_catalogo = hash(tuple(
+        (dim, frozenset(valores)) for dim, valores in sorted(valores_por_dim.items())
+    ))
+    chave_cache = (
+        id(quadro._df), len(quadro._df), tuple(quadro._df.columns), assinatura_catalogo
+    )
     normalizados = _CACHE_CANDIDATOS_FUZZY.get(chave_cache)
     if normalizados is None:
-        candidatos = {
-            str(v).strip()
-            for valores in nomes_para_anonimizar(quadro).values()
-            for v in valores
-            if str(v).strip() and len(str(v).strip()) >= 2
-        }
-        for dim in DIMENSOES_TEXTO:
-            coluna = quadro.cols.get(dim)
-            if coluna and coluna in quadro._df.columns:
-                candidatos.update(
-                    str(v).strip()
-                    for v in quadro._df[coluna].dropna().unique()
-                    if str(v).strip() and len(str(v).strip()) >= 2
-                )
-        normalizados_dict = {}
-        for valor in candidatos:
-            nv = compacto(valor)
-            if nv:
-                normalizados_dict.setdefault(nv, valor)
-        # Cada candidato é preparado uma única vez: caracteres e presença de dígitos
-        # são reutilizados em todas as perguntas, em vez de recalculados no loop interno.
+        catalogo = {}
+        for dim, valores in sorted(valores_por_dim.items()):
+            for valor in sorted(valores, key=lambda item: (normalizar(item), item.casefold())):
+                nv = compacto(valor)
+                if not nv:
+                    continue
+                registro = catalogo.setdefault(nv, {"original": valor, "dimensoes": set()})
+                registro["dimensoes"].add(dim)
+                # Preferir o rótulo mais legível/canônico em colisões de caixa/acentos.
+                if len(valor) < len(registro["original"]):
+                    registro["original"] = valor
+
         registros = tuple(
-            (nv, original, frozenset(nv), bool(re.search(r"\d", nv)))
-            for nv, original in normalizados_dict.items()
+            (nv, item["original"], frozenset(item["dimensoes"]), frozenset(nv), bool(re.search(r"\d", nv)))
+            for nv, item in catalogo.items()
         )
         indice_caracteres = {}
-        for idx, (nv, _original, caracteres, _tem_digito) in enumerate(registros):
+        indices_por_dimensao = {}
+        indice_exato = {}
+        for idx, (nv, _original, dims, caracteres, _tem_digito) in enumerate(registros):
+            indice_exato[nv] = idx
+            for dim in dims:
+                indices_por_dimensao.setdefault(dim, set()).add(idx)
             for caractere in caracteres:
                 indice_caracteres.setdefault(caractere, set()).add(idx)
-        normalizados = (registros, indice_caracteres)
+        normalizados = (registros, indice_caracteres, indices_por_dimensao, indice_exato)
         if len(_CACHE_CANDIDATOS_FUZZY) >= _LIMITE_CACHE_CANDIDATOS_FUZZY:
             _CACHE_CANDIDATOS_FUZZY.clear()
         _CACHE_CANDIDATOS_FUZZY[chave_cache] = normalizados
 
-    if not normalizados or not normalizados[0]:
-        return texto, [], None
-    registros, indice_caracteres = normalizados
+    registros, indice_caracteres, indices_por_dimensao, indice_exato = normalizados
+    if not registros:
+        return texto, [], None, None
 
     padrao = re.compile(r"[\wÀ-ÖØ-öø-ÿ]+(?:[-./][\wÀ-ÖØ-öø-ÿ]+)*", re.UNICODE)
     tokens = list(padrao.finditer(texto))
     if not tokens:
-        return texto, [], None
-
-    ignorar = {
-        "qual", "quais", "foi", "foram", "e", "o", "a", "os", "as", "um", "uma",
-        "de", "da", "do", "das", "dos", "em", "no", "na", "nos", "nas", "por",
-        "para", "com", "quanto", "quantos", "quantas", "me", "mostre", "traga",
-        "faturamento", "venda", "vendas", "quantidade", "vendida", "vendido", "total",
-        "valor", "media", "médio", "medio", "pedido", "pedidos", "cliente", "produto",
-        "sku", "vendedor", "representante", "empresa", "segmento", "mes", "mês", "ano",
-    }
+        return texto, [], None, None
 
     spans = []
-    for i, tok in enumerate(tokens):
-        # Mantém a janela de até 6 tokens da versão funcional.
+    vistos_spans = set()
+    for i, token in enumerate(tokens):
         for quantidade in range(1, min(6, len(tokens) - i) + 1):
             fim = i + quantidade - 1
             partes = [normalizar(x.group()) for x in tokens[i:fim + 1]]
             if not any(parte not in ignorar for parte in partes):
                 continue
-            a, b = tok.start(), tokens[fim].end()
-            trecho = texto[a:b]
+            trecho = texto[token.start():tokens[fim].end()]
             alvo = compacto(trecho)
-            if len(alvo) >= 4:
-                spans.append((a, b, trecho, alvo))
+            if len(alvo) < 4:
+                continue
+            chave_span = (token.start(), tokens[fim].end())
+            if chave_span not in vistos_spans:
+                spans.append((token.start(), tokens[fim].end(), trecho, alvo, partes, i))
+                vistos_spans.add(chave_span)
 
     if not spans:
-        return texto, [], None
+        return texto, [], None, None
 
-    pontuacoes = []
-    for a, b, trecho, alvo in spans:
-        alvo_chars = frozenset(alvo)
-        alfanumerico = bool(re.search(r"[a-z]", alvo) and re.search(r"\d", alvo))
-        # Índice invertido: só calcula similaridade para candidatos com ao menos
-        # um caractere em comum. Isso mantém o comportamento de zero sobreposição,
-        # mas evita varrer candidatos impossíveis para cada sequência da pergunta.
+    # Antes da busca aproximada, identifica trechos que já correspondem a um nome
+    # completo da base. Isso é importante para nomes compostos com pontuação ou
+    # conectores, por exemplo "Basso & Pancote": sem essa proteção, o token
+    # "Basso" poderia ser comparado isoladamente a outro nome como "PASSOS".
+    spans_exatos = []
+    for a, b, _trecho, alvo, _partes, _indice_inicio in spans:
+        indice_nome_exato = indice_exato.get(alvo)
+        if indice_nome_exato is None:
+            continue
+        dims_ativas_exatas = dimensoes_contextuais(a)
+        dims_nome_exato = registros[indice_nome_exato][2]
+        if not dims_ativas_exatas or (dims_nome_exato & dims_ativas_exatas):
+            spans_exatos.append((a, b))
+
+    def contido_em_nome_exato(a, b):
+        return any(
+            inicio_exato <= a and b <= fim_exato
+            and (inicio_exato, fim_exato) != (a, b)
+            for inicio_exato, fim_exato in spans_exatos
+        )
+
+    candidatos_por_span = []
+    for a, b, trecho, alvo, partes, indice_inicio in spans:
+        # Nunca proponha uma correção para parte de um nome composto que já foi
+        # reconhecido integralmente na base.
+        if contido_em_nome_exato(a, b):
+            continue
+        dims_ativas = dimensoes_contextuais(a)
+        indices_dimensao = set()
+        if dims_ativas:
+            for dim in dims_ativas:
+                indices_dimensao.update(indices_por_dimensao.get(dim, set()))
+        # Se a dica não corresponde a nenhuma dimensão disponível, usa o catálogo todo.
+        usar_catalogo_todo = not indices_dimensao
+
+        # Um valor já existente exatamente nessa dimensão não deve ser proposto como erro.
+        indice_alvo = indice_exato.get(alvo)
+        if indice_alvo is not None:
+            dims_candidato = registros[indice_alvo][2]
+            if usar_catalogo_todo or (dims_candidato & dims_ativas):
+                continue
+
+        # Não usar o rótulo da dimensão como parte do nome candidato (ex.: "cliente Mercado").
+        # Se a palavra se repetir depois do rótulo ("cliente Cliente Exato"), ela pode
+        # fazer parte do nome real. Preposições/conjunções só serão aceitas se alinhadas
+        # com os mesmos tokens do nome candidato, verificado abaixo.
+        if partes[0] in rotulos_dimensao:
+            rotulo_repetido = (
+                indice_inicio > 0
+                and normalizar(tokens[indice_inicio - 1].group()) == partes[0]
+            )
+            if not rotulo_repetido:
+                continue
+
+        alvo_tem_digito = bool(re.search(r"\d", alvo))
+        alvo_alfanum = bool(re.search(r"[a-z]", alvo) and alvo_tem_digito)
         indices_candidatos = set()
-        for caractere in alvo_chars:
-            indices_candidatos.update(indice_caracteres.get(caractere, ()))
-        for idx in sorted(indices_candidatos):
-            candidato_norm, candidato_original, candidato_chars, candidato_tem_digito = registros[idx]
-            # Mantém a proteção de códigos alfanuméricos para não confundir BP500/BP5000.
-            if alfanumerico and (
-                len(candidato_norm) != len(alvo) or not candidato_tem_digito
-            ):
+        for caractere in set(alvo):
+            indices_candidatos.update(indice_caracteres.get(caractere, set()))
+        pontuados = []
+        for idx in indices_candidatos:
+            candidato_norm, candidato, dims_candidato, _caracteres, candidato_tem_digito = registros[idx]
+            if not usar_catalogo_todo and not (dims_candidato & dims_ativas):
                 continue
-            matcher = difflib.SequenceMatcher(None, alvo, candidato_norm, autojunk=False)
-            ratio = matcher.ratio()
-            bloco = matcher.find_longest_match(0, len(alvo), 0, len(candidato_norm))
+            if candidato_norm == alvo:
+                continue
+            # Se a expressão contém conectivos/preposições, só se compara com um nome
+            # que possua exatamente esses tokens nessas posições (ex.: "Máquina de Lavar").
+            if any(parte in ignorar for parte in partes):
+                partes_candidato = [normalizar(t.group()) for t in padrao.finditer(candidato)]
+                if len(partes_candidato) != len(partes) or any(
+                    parte in ignorar and partes_candidato[pos] != parte
+                    for pos, parte in enumerate(partes)
+                ):
+                    continue
+            # Não transformar palavras em códigos nem aceitar pequenas diferenças de SKU.
+            if alvo_alfanum and (not candidato_tem_digito or len(candidato_norm) != len(alvo)):
+                continue
+            if candidato_tem_digito != alvo_tem_digito:
+                continue
+            maior = max(len(alvo), len(candidato_norm))
+            if abs(len(alvo) - len(candidato_norm)) > max(2, int(maior * 0.25)):
+                continue
+            comparador = difflib.SequenceMatcher(None, alvo, candidato_norm, autojunk=False)
+            ratio = comparador.ratio()
+            bloco = comparador.find_longest_match(0, len(alvo), 0, len(candidato_norm))
             cobertura = bloco.size / max(len(alvo), len(candidato_norm), 1)
-            if bloco.size == 0:
+            if cobertura < 0.50:
                 continue
-            pontuacoes.append({
+            # Curto patamar por tamanho: um erro em uma palavra pequena deve pedir
+            # confirmação, enquanto um erro inequívoco em um nome maior pode ser corrigido.
+            tamanho = max(len(alvo), len(candidato_norm))
+            limite_confirmacao = 0.64 if tamanho <= 6 else (0.68 if tamanho <= 9 else 0.70)
+            limite_auto = max(limite, 0.82 if tamanho <= 7 else 0.84)
+            if alvo_alfanum:
+                limite_confirmacao = max(limite_confirmacao, 0.76)
+                limite_auto = max(limite_auto, 0.88)
+            if ratio < limite_confirmacao:
+                continue
+            pontuados.append({
                 "a": a, "b": b, "trecho": trecho, "alvo": alvo,
-                "candidato_norm": candidato_norm, "candidato": candidato_original,
-                "ratio": ratio, "cobertura": cobertura, "alfanumerico": alfanumerico,
+                "candidato_norm": candidato_norm, "candidato": candidato,
+                "ratio": ratio, "cobertura": cobertura,
+                "limite_auto": limite_auto, "limite_confirmacao": limite_confirmacao,
             })
 
-    if not pontuacoes:
-        return texto, [], None
+        if not pontuados:
+            continue
+        # Ambiguidade é medida entre candidatos do MESMO trecho, não comparando
+        # acidentalmente o nome de um cliente com o nome de um produto de outro trecho.
+        por_candidato = {}
+        for item in pontuados:
+            existente = por_candidato.get(item["candidato_norm"])
+            if existente is None or item["ratio"] > existente["ratio"]:
+                por_candidato[item["candidato_norm"]] = item
+        ranking = sorted(por_candidato.values(), key=lambda x: x["ratio"], reverse=True)
+        melhor = ranking[0]
+        empatados = [x for x in ranking[1:] if melhor["ratio"] - x["ratio"] < margem]
+        opcoes = [melhor["candidato"]] + [x["candidato"] for x in empatados[:2]]
+        candidatos_por_span.append({
+            **melhor, "opcoes": opcoes, "ambigua": bool(empatados),
+        })
 
-    melhores_por_trecho = {}
-    for item in pontuacoes:
-        chave = (item["a"], item["b"])
-        anterior = melhores_por_trecho.get(chave)
-        if anterior is None or item["ratio"] > anterior["ratio"]:
-            melhores_por_trecho[chave] = item
-    melhores = sorted(
-        melhores_por_trecho.values(),
-        key=lambda x: (x["ratio"], -len(x["trecho"])), reverse=True
-    )
-    melhor = melhores[0]
-    segundo = next(
-        (x for x in melhores[1:] if x["candidato_norm"] != melhor["candidato_norm"]), None
-    )
-    ambigua = bool(
-        segundo and melhor["ratio"] - segundo["ratio"] < margem
-        and segundo["candidato_norm"] != melhor["candidato_norm"]
-    )
+    if not candidatos_por_span:
+        return texto, [], None, None
 
-    if melhor["ratio"] >= limite and not ambigua:
+    # Escolhe o trecho mais provável; em empate, prioriza o trecho mais específico/longer.
+    candidatos_por_span.sort(
+        key=lambda x: (x["ratio"], len(x["alvo"]), len(x["trecho"])), reverse=True
+    )
+    melhor = candidatos_por_span[0]
+    if melhor["ratio"] >= melhor["limite_auto"] and not melhor["ambigua"]:
         corrigida = texto[:melhor["a"]] + melhor["candidato"] + texto[melhor["b"]:]
-        return corrigida, [(melhor["trecho"], melhor["candidato"])], None
+        return corrigida, [(melhor["trecho"], melhor["candidato"])], None, None
 
-    if melhor["ratio"] > 0 and (melhor["ratio"] < limite or ambigua):
-        return texto, [], f'Em "{melhor["trecho"]}" você quis dizer "{melhor["candidato"]}"?'
-
-    return texto, [], None
-
+    # Só interrompe para confirmação quando existe semelhança razoável. O antigo
+    # limiar de 50% gerava perguntas sobre palavras sem relação com um nome da base.
+    if melhor["ambigua"]:
+        opcoes_txt = " ou ".join(f'"{x}"' for x in melhor["opcoes"])
+        sugestao = (
+            f'Encontrei mais de um nome parecido com "{melhor["trecho"]}": {opcoes_txt}. '
+            "Digite o nome correto para confirmar."
+        )
+    else:
+        sugestao = (
+            f'Em "{melhor["trecho"]}", você quis dizer "{melhor["candidato"]}"? '
+            "Responda sim ou não."
+        )
+    meta = {
+        "termo": melhor["trecho"],
+        "candidato": melhor["candidato"],
+        "opcoes": melhor["opcoes"],
+        "ambigua": melhor["ambigua"],
+    }
+    return texto, [], sugestao, meta
 
 def montar_esquema(quadro):
 
@@ -1818,6 +2002,392 @@ def consultar_gemini(prompt, chave_api, sistema=INSTRUCOES_IA, json_mode=False, 
 
     return texto
 
+
+# ============================================================
+# EXPLICAÇÃO ANÔNIMA DA PROJEÇÃO MENSAL
+# ============================================================
+
+INSTRUCOES_EXPLICACAO_PROJECAO = """
+Você é um analista experiente de séries temporais e negócios, escrevendo em português do Brasil.
+Sua tarefa NÃO é repetir números nem declarar fatos: os fatos já foram calculados e serão exibidos
+separadamente pela aplicação. Sua tarefa é sugerir hipóteses plausíveis, verificações e ações práticas.
+
+Você pode explorar hipóteses relacionadas a sazonalidade, mudança de ritmo, demanda irregular,
+eventos pontuais, estoque, preço, mix comercial ou comportamento de mercado, mas nunca afirme que
+algum desses fatores realmente aconteceu. Escreva como possibilidades a investigar, ligadas aos
+indicadores recebidos, e evite listas genéricas de causas desconectadas dos dados.
+
+REGRAS:
+- Não invente fatos, métricas, percentuais, números, datas, eventos, nomes, códigos, clientes,
+  vendedores, produtos específicos ou identificadores. Não use algarismos no texto das respostas.
+- Não repita as métricas numéricas; a aplicação apresenta os números calculados localmente.
+- Não apresente hipóteses como causas confirmadas. Evite expressões categóricas como "a causa é",
+  "foi causado por", "com certeza" ou "isso comprova".
+- Se os indicadores forem fracos ou insuficientes, diga o que falta verificar e não force uma conclusão.
+- Não peça dados identificáveis. Sugira verificações que a equipe pode fazer internamente.
+- Responda SOMENTE com um objeto JSON válido, sem Markdown ou texto antes/depois, usando exatamente
+  este esquema e as três chaves indicadas:
+  {"hipoteses": ["...", "..."], "verificacoes": ["...", "..."], "acoes": ["..."]}
+- Forneça de duas a três hipóteses, duas a três verificações e de uma a três ações. Cada item deve
+  ser uma string curta e completa em português. A lista de hipóteses deve deixar claro que são
+  hipóteses, por exemplo começando com "Hipótese:".
+"""
+
+_CHAVES_INDICADORES_PROJECAO = {
+    "tipo_analise", "metrica", "unidade", "horizonte_meses", "meses_historicos", "simulacoes",
+    "modelo", "wape_percentual", "erro_medio_absoluto", "vies_medio",
+    "mediana_previsao_central", "previsao_central_primeiro_periodo",
+    "previsao_central_ultimo_periodo", "variacao_previsao_inicio_fim_percentual",
+    "mediana_limite_inferior_80", "mediana_limite_superior_80",
+    "largura_mediana_intervalo_80_relativa_percentual",
+}
+
+_MODELOS_PROJECAO_SEGUROS = {
+    normalizar("Último mês"): "Último mês",
+    normalizar("Média móvel de 3 meses"): "Média móvel de 3 meses",
+    normalizar("Média móvel de 6 meses"): "Média móvel de 6 meses",
+    normalizar("Mesmo mês do ano anterior"): "Mesmo mês do ano anterior",
+    normalizar("Tendência + sazonalidade mensal"): "Tendência + sazonalidade mensal",
+    normalizar("Último trimestre"): "Último trimestre",
+    normalizar("Média móvel de 4 trimestres"): "Média móvel de 4 trimestres",
+    normalizar("Sazonal ingênuo (mesmo trimestre do ano anterior)"): "Modelo sazonal trimestral",
+    normalizar("Tendência + sazonalidade trimestral"): "Tendência + sazonalidade trimestral",
+    normalizar("Seleção individual por SKU + restrição de estoque"): "Seleção agregada de modelos com restrição de estoque",
+    normalizar("Melhor modelo selecionado individualmente por SKU"): "Seleção agregada de modelos",
+}
+
+
+def _numero_finito_anonimo(valor, casas=2):
+    """Converte para número arredondado; NaN, infinito e booleanos viram None."""
+    import math
+    try:
+        if valor is None or isinstance(valor, bool):
+            return None
+        numero = float(valor)
+        if not math.isfinite(numero):
+            return None
+        return round(numero, casas)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _inteiro_validado(valor, nome, minimo, maximo):
+    """Converte e valida um inteiro dentro dos limites explícitos do produto."""
+    import math
+    if isinstance(valor, bool) or valor is None:
+        raise ValueError(f"O campo '{nome}' é obrigatório e deve ser inteiro.")
+    try:
+        n = float(valor)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"O campo '{nome}' deve ser numérico.")
+    if not math.isfinite(n) or not n.is_integer() or not minimo <= n <= maximo:
+        raise ValueError(f"O campo '{nome}' deve ser um inteiro entre {minimo} e {maximo}.")
+    return int(n)
+
+
+def _serie_numerica_finita(df, nome):
+    """Converte a coluna sem perder o alinhamento entre períodos e remove NaN/inf."""
+    import math
+    if nome not in df.columns:
+        return pd.Series(index=df.index, dtype=float)
+    serie = pd.to_numeric(df[nome], errors="coerce").astype(float)
+    return serie.map(lambda x: x if math.isfinite(float(x)) else float("nan"))
+
+
+def validar_indicadores_projecao_anonimos(indicadores):
+    """Fail-closed: aceita apenas o esquema e os intervalos de indicadores autorizados."""
+    import math
+    if not isinstance(indicadores, dict) or set(indicadores) != _CHAVES_INDICADORES_PROJECAO:
+        raise ValueError("O pacote de indicadores da projeção não corresponde à lista permitida.")
+    if indicadores.get("tipo_analise") != "projecao_probabilistica_mensal":
+        raise ValueError("Tipo de análise não autorizado.")
+    if indicadores.get("metrica") not in {"faturamento", "quantidade_vendida"}:
+        raise ValueError("Métrica de projeção inválida.")
+    if indicadores.get("unidade") not in {"moeda", "unidades"}:
+        raise ValueError("Unidade de projeção inválida.")
+    _inteiro_validado(indicadores.get("horizonte_meses"), "horizonte_meses", 1, 24)
+    _inteiro_validado(indicadores.get("meses_historicos"), "meses_historicos", 0, 1200)
+    if indicadores.get("modelo") not in set(_MODELOS_PROJECAO_SEGUROS.values()) | {"modelo estatístico selecionado"}:
+        raise ValueError("O rótulo do modelo não pertence à lista permitida.")
+    simulacoes = indicadores.get("simulacoes")
+    if simulacoes is not None:
+        _inteiro_validado(simulacoes, "simulacoes", 0, 10000)
+    for chave, valor in indicadores.items():
+        if isinstance(valor, bool):
+            raise ValueError(f"Indicador '{chave}' não pode ser booleano.")
+        if isinstance(valor, (int, float)) and not math.isfinite(float(valor)):
+            raise ValueError(f"Indicador '{chave}' contém valor não finito.")
+    for chave in ("wape_percentual", "erro_medio_absoluto", "simulacoes"):
+        valor = indicadores.get(chave)
+        if valor is not None and valor < 0:
+            raise ValueError(f"Indicador '{chave}' não pode ser negativo.")
+    inf = indicadores.get("mediana_limite_inferior_80")
+    sup = indicadores.get("mediana_limite_superior_80")
+    if inf is not None and sup is not None and inf > sup:
+        raise ValueError("O limite inferior mediano está acima do limite superior.")
+    largura = indicadores.get("largura_mediana_intervalo_80_relativa_percentual")
+    if largura is not None and largura < 0:
+        raise ValueError("A largura do intervalo não pode ser negativa.")
+    # Garante que o pacote seja serializável sem NaN/Infinity e não contenha campos extras.
+    json.dumps(indicadores, ensure_ascii=False, allow_nan=False)
+    return indicadores
+
+
+def preparar_indicadores_projecao_anonimos(resultado, horizonte, metrica, unidade):
+    """Monta e valida uma allowlist mínima; nunca serializa o resultado completo da engine."""
+    if not isinstance(resultado, dict) or resultado.get("ok") is not True:
+        raise ValueError("Não há uma projeção válida para explicar.")
+    previsoes = resultado.get("previsoes")
+    if not isinstance(previsoes, pd.DataFrame) or previsoes.empty:
+        raise ValueError("A projeção não contém previsões para resumir.")
+
+    horizonte_ok = _inteiro_validado(horizonte, "horizonte", 1, 24)
+    if len(previsoes) != horizonte_ok:
+        raise ValueError("O horizonte informado não corresponde à quantidade de previsões calculadas.")
+    if "Previsão central (P50)" not in previsoes.columns:
+        raise ValueError("A projeção não contém a previsão central necessária para análise.")
+
+    metrica_norm = normalizar(metrica)
+    if metrica_norm in {"faturamento", "valor", "vendas"}:
+        metrica_segura = "faturamento"
+        unidade_segura = "moeda"
+    elif metrica_norm in {"quantidade", "quantidade vendida", "unidades", "qtde"}:
+        metrica_segura = "quantidade_vendida"
+        unidade_segura = "unidades"
+    else:
+        raise ValueError("A métrica selecionada não é permitida para a explicação.")
+
+    centrais = _serie_numerica_finita(previsoes, "Previsão central (P50)")
+    if centrais.notna().sum() == 0:
+        raise ValueError("Não há valores numéricos válidos nas previsões centrais.")
+
+    inicio_bruto = _numero_finito_anonimo(centrais.iloc[0], 8)
+    fim_bruto = _numero_finito_anonimo(centrais.iloc[-1], 8)
+    inicio = _numero_finito_anonimo(centrais.iloc[0])
+    fim = _numero_finito_anonimo(centrais.iloc[-1])
+    mediana_central = _numero_finito_anonimo(centrais.median())
+    variacao = None
+    if inicio_bruto is not None and fim_bruto is not None and abs(inicio_bruto) > 1e-9:
+        variacao = _numero_finito_anonimo((fim_bruto - inicio_bruto) / abs(inicio_bruto) * 100, 1)
+
+    inferiores = _serie_numerica_finita(previsoes, "Limite inferior 80% (P10)")
+    superiores = _serie_numerica_finita(previsoes, "Limite superior 80% (P90)")
+    intervalos = pd.DataFrame({"central": centrais, "inferior": inferiores, "superior": superiores}).dropna()
+    if not intervalos.empty and (intervalos["superior"] < intervalos["inferior"]).any():
+        raise ValueError("Há intervalos de previsão inconsistentes: limite superior abaixo do inferior.")
+
+    mediana_inferior = _numero_finito_anonimo(intervalos["inferior"].median()) if not intervalos.empty else None
+    mediana_superior = _numero_finito_anonimo(intervalos["superior"].median()) if not intervalos.empty else None
+    larguras = []
+    for linha in intervalos.itertuples(index=False):
+        if abs(linha.central) > 1e-9:
+            larguras.append((linha.superior - linha.inferior) / abs(linha.central) * 100)
+    largura_mediana = _numero_finito_anonimo(pd.Series(larguras).median(), 1) if larguras else None
+
+    n_historico = resultado.get("n_meses")
+    if n_historico is None:
+        historico = resultado.get("historico")
+        try:
+            n_historico = len(historico) if historico is not None else None
+        except TypeError:
+            n_historico = None
+    if n_historico is None:
+        raise ValueError("A engine não informou a quantidade de meses históricos.")
+    n_historico = _inteiro_validado(n_historico, "meses_historicos", 0, 1200)
+
+    rotulo_bruto = normalizar(resultado.get("modelo_rotulo") or "")
+    modelo_seguro = _MODELOS_PROJECAO_SEGUROS.get(rotulo_bruto, "modelo estatístico selecionado")
+
+    indicadores = {
+        "tipo_analise": "projecao_probabilistica_mensal",
+        "metrica": metrica_segura,
+        "unidade": unidade_segura,
+        "horizonte_meses": horizonte_ok,
+        "meses_historicos": n_historico,
+        "simulacoes": (
+            _inteiro_validado(resultado.get("simulacoes"), "simulacoes", 0, 10000)
+            if resultado.get("simulacoes") is not None else None
+        ),
+        "modelo": modelo_seguro,
+        "wape_percentual": _numero_finito_anonimo(resultado.get("wape"), 1),
+        "erro_medio_absoluto": _numero_finito_anonimo(resultado.get("mae"), 2),
+        "vies_medio": _numero_finito_anonimo(resultado.get("bias"), 2),
+        "mediana_previsao_central": mediana_central,
+        "previsao_central_primeiro_periodo": inicio,
+        "previsao_central_ultimo_periodo": fim,
+        "variacao_previsao_inicio_fim_percentual": variacao,
+        "mediana_limite_inferior_80": mediana_inferior,
+        "mediana_limite_superior_80": mediana_superior,
+        "largura_mediana_intervalo_80_relativa_percentual": largura_mediana,
+    }
+    return validar_indicadores_projecao_anonimos(indicadores)
+
+
+def _formatar_numero_projecao(valor, casas=2):
+    if valor is None:
+        return "indisponível"
+    return f"{float(valor):,.{casas}f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def _fatos_projecao_calculados(indicadores):
+    """Texto factual produzido localmente; não depende da narrativa da IA."""
+    unidade = "R$" if indicadores["unidade"] == "moeda" else "unidades"
+    fatos = [
+        f"Métrica analisada: {'faturamento' if indicadores['metrica'] == 'faturamento' else 'quantidade vendida'}.",
+        f"Horizonte: {indicadores['horizonte_meses']} períodos; histórico disponível: {indicadores['meses_historicos']} meses.",
+        f"Modelo selecionado: {indicadores['modelo']}.",
+    ]
+    wape = indicadores["wape_percentual"]
+    if wape is None:
+        fatos.append("WAPE retrospectivo: indisponível; não é possível avaliar a precisão por esta métrica.")
+    else:
+        fatos.append(f"WAPE retrospectivo: {_formatar_numero_projecao(wape, 1)}%. Ele resume o erro relativo no backtest e não garante acerto futuro.")
+    mae = indicadores["erro_medio_absoluto"]
+    if mae is None:
+        fatos.append("Erro médio absoluto: indisponível.")
+    else:
+        fatos.append(f"Erro médio absoluto no backtest: {unidade} {_formatar_numero_projecao(mae, 2)}.")
+    vies = indicadores["vies_medio"]
+    if vies is None:
+        fatos.append("Viés médio no backtest: indisponível.")
+    elif vies > 0:
+        fatos.append(f"Viés médio: {unidade} {_formatar_numero_projecao(vies, 2)}; pela convenção do modelo, indica tendência histórica de superestimar.")
+    elif vies < 0:
+        fatos.append(f"Viés médio: {unidade} {_formatar_numero_projecao(vies, 2)}; pela convenção do modelo, indica tendência histórica de subestimar.")
+    else:
+        fatos.append("Viés médio no backtest: zero após arredondamento; isso não significa ausência de erro.")
+
+    variacao = indicadores["variacao_previsao_inicio_fim_percentual"]
+    if variacao is None:
+        fatos.append("Mudança entre a primeira e a última previsão: indisponível ou sem base inicial adequada.")
+    else:
+        direcao = "aumenta" if variacao > 1 else "diminui" if variacao < -1 else "permanece aproximadamente estável"
+        fatos.append(f"A previsão central {direcao} entre o primeiro e o último período: variação calculada de {_formatar_numero_projecao(variacao, 1)}%.")
+    central = indicadores["mediana_previsao_central"]
+    if central is not None:
+        fatos.append(f"Mediana da previsão central ao longo do horizonte: {unidade} {_formatar_numero_projecao(central, 2)}.")
+    inferior, superior = indicadores["mediana_limite_inferior_80"], indicadores["mediana_limite_superior_80"]
+    if inferior is not None and superior is not None:
+        fatos.append(f"Medianas dos limites do intervalo de 80%: {unidade} {_formatar_numero_projecao(inferior, 2)} a {unidade} {_formatar_numero_projecao(superior, 2)}.")
+    largura = indicadores["largura_mediana_intervalo_80_relativa_percentual"]
+    if largura is not None:
+        fatos.append(f"Largura mediana do intervalo de 80% em relação à previsão central: {_formatar_numero_projecao(largura, 1)}%.")
+    if indicadores["meses_historicos"] < 24:
+        fatos.append("O histórico tem menos de dois ciclos anuais completos; conclusões sobre sazonalidade anual exigem cautela.")
+    return fatos
+
+
+def _validar_resposta_ia_projecao(texto):
+    """Valida forma, campos, comprimento e sinais óbvios de invenção/identificação no texto da IA."""
+    dados = _extrair_json(texto)
+    chaves_esperadas = {"hipoteses", "verificacoes", "acoes"}
+    if not isinstance(dados, dict) or set(dados) != chaves_esperadas:
+        raise ValueError("A resposta da IA não respeitou o esquema JSON obrigatório.")
+    limites = {"hipoteses": (2, 3), "verificacoes": (2, 3), "acoes": (1, 3)}
+    frases_categoricas = re.compile(
+        r"\b(a causa (?:é|foi)|(?:é|foi) causado por|foi provocad[oa] por|com certeza|"
+        r"comprovadamente|isso comprova|garante que|deve-se a|decorre diretamente de|"
+        r"explica a (?:alta|queda|varia[cç][aã]o|tend[eê]ncia)|"
+        r"explicam a (?:alta|queda|varia[cç][aã]o|tend[eê]ncia)|"
+        r"é consequência direta de|foi consequência de)\b", re.IGNORECASE
+    )
+    alegacoes_numericas_por_extenso = re.compile(
+        r"\b(por cento|percentuais?|dobro|triplo|qu[aá]druplo|metade|"
+        r"duas? vezes|tr[eê]s vezes|quatro vezes|milh(?:[aã]o|[õo]es)|"
+        r"bilh(?:[aã]o|[õo]es))\b", re.IGNORECASE
+    )
+    possivel_nome_proprio = re.compile(r"\b[A-ZÁÉÍÓÚÂÊÔÃÕÇ][a-záéíóúâêôãõç]{2,}\b")
+    termos_tecnicos_bloqueados = re.compile(r"\b(?:WAPE|MAE|SKU|CPF|CNPJ|API|URL|ID)\b", re.IGNORECASE)
+    saida = {}
+    for campo, (min_itens, max_itens) in limites.items():
+        itens = dados.get(campo)
+        if not isinstance(itens, list) or not min_itens <= len(itens) <= max_itens:
+            raise ValueError(f"A seção '{campo}' deve conter entre {min_itens} e {max_itens} itens.")
+        limpos = []
+        for item in itens:
+            if not isinstance(item, str):
+                raise ValueError(f"A seção '{campo}' contém item que não é texto.")
+            item = re.sub(r"\s+", " ", item).strip()
+            if not 25 <= len(item) <= 400:
+                raise ValueError(f"A seção '{campo}' contém texto muito curto ou longo.")
+            if re.search(r"\d", item) or alegacoes_numericas_por_extenso.search(item):
+                raise ValueError("A resposta gerada contém números ou alegações quantitativas não validadas; os fatos numéricos são exibidos localmente.")
+            if sanitizar_valor_textual(item) != item:
+                raise ValueError("A resposta gerada parece conter dado pessoal ou identificador.")
+            if frases_categoricas.search(item):
+                raise ValueError("Uma hipótese foi apresentada como causa confirmada.")
+            if termos_tecnicos_bloqueados.search(item):
+                raise ValueError("A resposta gerada contém sigla técnica ou identificador não permitido.")
+            # Evita nomes de pessoas, marcas e locais no corpo do texto. A primeira palavra
+            # é permitida por estar no início da frase; não há entidades nomeadas no pacote.
+            texto_para_nomes = re.sub(r"^Hip[oó]tese:\s*", "", item, flags=re.IGNORECASE) if campo == "hipoteses" else item
+            primeira_palavra = re.search(r"[A-Za-zÁÉÍÓÚÂÊÔÃÕÇáéíóúâêôãõç]+", texto_para_nomes)
+            for nome_candidato in possivel_nome_proprio.finditer(texto_para_nomes):
+                if primeira_palavra and nome_candidato.start() == primeira_palavra.start():
+                    continue
+                raise ValueError("A resposta gerada parece conter nome próprio não autorizado.")
+            if campo == "hipoteses" and not re.search(r"\bhip[oó]tese\b", item, re.IGNORECASE):
+                item = "Hipótese: " + item[0].lower() + item[1:]
+            if len(item) > 420:
+                raise ValueError(f"A seção '{campo}' contém texto muito longo após a normalização.")
+            limpos.append(item)
+        saida[campo] = limpos
+    return saida
+
+
+def _montar_explicacao_projecao(fatos, resposta):
+    partes = ["### Leitura objetiva dos indicadores", "\n".join(f"- {fato}" for fato in fatos)]
+    partes.append("### Hipóteses para investigar")
+    partes.append("\n".join(f"- {item}" for item in resposta["hipoteses"]))
+    partes.append("### O que verificar")
+    partes.append("\n".join(f"- {item}" for item in resposta["verificacoes"]))
+    partes.append("### Ações sugeridas")
+    partes.append("\n".join(f"- {item}" for item in resposta["acoes"]))
+    partes.append("*As hipóteses são possibilidades, não causas confirmadas. A confirmação depende de verificações internas que não são enviadas à IA.*")
+    return "\n\n".join(partes)
+
+
+def gerar_explicacao_projecao_anonima(resultado, horizonte, metrica, unidade):
+    """Gera hipóteses com IA, mantendo os fatos numéricos sob validação determinística local."""
+    chave_api = obter_chave_api()
+    if not chave_api:
+        raise RuntimeError("Chave da API Gemini não configurada. Defina GEMINI_API_KEY nos secrets ou no ambiente.")
+
+    indicadores = preparar_indicadores_projecao_anonimos(resultado, horizonte, metrica, unidade)
+    fatos = _fatos_projecao_calculados(indicadores)
+    prompt = (
+        "Analise os indicadores anônimos e produza somente hipóteses, verificações e ações. "
+        "Não repita números e não acrescente fatos numéricos: a aplicação os apresenta separadamente. "
+        "As hipóteses devem relacionar-se aos sinais observados, mas sempre como possibilidades.\n\n"
+        "INDICADORES PERMITIDOS (JSON):\n"
+        + json.dumps(indicadores, ensure_ascii=False, allow_nan=False)
+        + "\n\nRetorne exatamente JSON com as chaves hipoteses, verificacoes e acoes."
+    )
+
+    # Uma segunda tentativa é reservada apenas para resposta fora do contrato.
+    for tentativa in range(2):
+        texto = consultar_gemini(
+            prompt if tentativa == 0 else (
+                prompt + "\n\nCORREÇÃO OBRIGATÓRIA: a resposta anterior falhou na validação. "
+                "Gere novamente JSON válido com exatamente as três chaves exigidas; "
+                "não inclua algarismos, métricas, datas, identificadores ou causas como fatos."
+            ),
+            chave_api,
+            sistema=INSTRUCOES_EXPLICACAO_PROJECAO,
+            json_mode=True,
+            temperatura=0.15,
+        )
+        try:
+            resposta = _validar_resposta_ia_projecao(texto)
+            return _montar_explicacao_projecao(fatos, resposta)
+        except (ValueError, TypeError, json.JSONDecodeError):
+            if tentativa == 1:
+                raise RuntimeError(
+                    "A IA não retornou uma explicação no formato seguro após duas tentativas. "
+                    "Tente gerar novamente."
+                )
+    raise RuntimeError("Não foi possível validar a explicação da projeção.")
+
 # ============================================================
 
 # FLUXO EM DUAS REQUISIÇÕES (sem Streamlit: fácil de testar)
@@ -1909,6 +2479,163 @@ def _consulta_rapida_sem_filtros(pergunta, quadro):
     return consulta
 
 
+def _detectar_consulta_clientes_sem_compra_mes(pergunta):
+    """Reconhece pedido genérico pela lista de clientes sem compra no mês atual.
+
+    Não intercepta perguntas sobre produto/SKU ou cliente específico: essas seguem
+    para o planejador geral.
+    """
+    p = normalizar(str(pergunta or ""))
+    if not re.search(r"\bclientes\b", p):
+        return False
+    if re.search(r"\b(?:produto|produtos|sku|item|itens|codigo|referencia)\b", p):
+        return False
+    pede_lista = bool(re.search(r"\b(?:quais|liste|listar|indique|mostre|mostra|informe|informa|diga|diga-me|me diga)\b", p))
+    sem_compra = bool(
+        re.search(r"\bnao\s+(?:compr\w*|fizeram\s+compra|realizaram\s+compra|tiveram\s+compra|efetuaram\s+compra)\b", p)
+        or re.search(r"\bsem\s+compras?\b", p)
+        or re.search(r"\bnao\s+tiveram\s+vendas\b", p)
+    )
+    menciona_mes = bool(re.search(
+        r"\b(?:(?:nesse|neste|esse|este|no|do|durante o)\s+)?mes(?:\s+(?:atual|corrente))?\b", p
+    ))
+    return pede_lista and sem_compra and menciona_mes
+
+
+def _saida_clientes_sem_compra_mes(quadro, pergunta):
+    """Calcula localmente clientes históricos sem compra registrada no mês corrente.
+
+    A consulta só conclui uma lista quando há ao menos um registro de vendas no mês,
+    usado como evidência mínima de que o período está presente na base recebida.
+    Não envia nomes de clientes para o modelo generativo.
+    """
+    if not _detectar_consulta_clientes_sem_compra_mes(pergunta):
+        return None
+
+    agora = pd.Timestamp(datetime.now().date())
+    inicio_mes = pd.Timestamp(agora.year, agora.month, 1)
+    mes_rotulo = inicio_mes.strftime("%m/%Y")
+    limite_rotulo = agora.strftime("%d/%m/%Y")
+    detalhes = {
+        "rota": "clientes_sem_compra_mes",
+        "mes_considerado": mes_rotulo,
+        "data_limite": limite_rotulo,
+        "calculo_local": True,
+        "nomes_enviados_a_ia": False,
+    }
+
+    def retorno(mensagem, status):
+        detalhes_retorno = {**detalhes, "status": status}
+        return {
+            "resposta": mensagem,
+            "resposta_segura": "Consulta de clientes sem compra calculada localmente.",
+            "detalhes": detalhes_retorno,
+            # Memória deliberadamente sem nomes nem lista de clientes.
+            "memoria": {
+                "pergunta": f"Clientes sem compra registrada no mês {mes_rotulo}",
+                "consultas": [],
+                "resposta": "A lista foi calculada localmente; identidades não foram guardadas na memória da IA.",
+            },
+        }
+
+    if not quadro.cols.get("cliente"):
+        return retorno(
+            "Não consigo listar esses clientes porque a base recebida não tem uma coluna de cliente reconhecida.",
+            "coluna_cliente_ausente",
+        )
+    if not quadro.tem_data:
+        return retorno(
+            "Não consigo confirmar quem não comprou neste mês porque a base recebida não tem uma coluna de data de venda válida.",
+            "coluna_data_ausente",
+        )
+
+    coluna_cliente = quadro.coluna("cliente")
+    datas = pd.to_datetime(quadro.tab["d"], errors="coerce")
+    ate_hoje = datas.notna() & (datas <= agora)
+    if not ate_hoje.any():
+        return retorno(
+            f"Não consigo verificar compras em {mes_rotulo}: a base não contém datas de venda válidas até {limite_rotulo}.",
+            "datas_insuficientes",
+        )
+
+    ultima_data = datas.loc[ate_hoje].max()
+    if ultima_data < inicio_mes:
+        return retorno(
+            f"Não consigo identificar os clientes sem compra em {mes_rotulo}, porque os dados de vendas recebidos vão somente até {ultima_data.strftime('%d/%m/%Y')}. Atualize a base com os registros deste mês e tente novamente.",
+            "base_desatualizada",
+        )
+
+    no_mes = datas.ge(inicio_mes) & datas.le(agora)
+    if not no_mes.any():
+        return retorno(
+            f"A base não contém registros de venda entre {inicio_mes.strftime('%d/%m/%Y')} e {limite_rotulo}. Sem registros deste mês, não é seguro concluir que os clientes não compraram; confirme se a base está atualizada.",
+            "sem_registros_no_mes",
+        )
+
+    def nome_valido(valor):
+        nome = str(valor or "").strip()
+        chave = normalizar(nome)
+        return bool(chave) and chave not in {
+            "nan", "none", "null", "(sem informacao)", "(nao informado)", "(sem informação)"
+        }
+
+    nomes_historicos = {}
+    for nome in quadro.tab.loc[ate_hoje, coluna_cliente].tolist():
+        if not nome_valido(nome):
+            continue
+        chave = normalizar(nome)
+        existente = nomes_historicos.get(chave)
+        nome = str(nome).strip()
+        if existente is None or (len(nome), nome.casefold()) < (len(existente), existente.casefold()):
+            nomes_historicos[chave] = nome
+
+    if not nomes_historicos:
+        return retorno(
+            "Não encontrei nomes de clientes identificáveis nas vendas com data válida até o momento.",
+            "clientes_nao_identificados",
+        )
+
+    compraram_no_mes = {
+        normalizar(str(nome).strip())
+        for nome in quadro.tab.loc[no_mes, coluna_cliente].tolist()
+        if nome_valido(nome)
+    }
+    sem_compra = sorted(
+        (nome for chave, nome in nomes_historicos.items() if chave not in compraram_no_mes),
+        key=lambda nome: normalizar(nome),
+    )
+    data_base = min(ultima_data, agora).strftime("%d/%m/%Y")
+    detalhes.update({
+        "status": "calculado",
+        "clientes_com_historico": len(nomes_historicos),
+        "clientes_sem_compra": len(sem_compra),
+        "considerar_registros_ate": data_base,
+    })
+
+    if not sem_compra:
+        return retorno(
+            f"Todos os clientes identificados no histórico têm ao menos uma compra registrada em {mes_rotulo}, considerando os dados até {data_base}.",
+            "todos_compraram_no_mes",
+        )
+
+    limite_lista = 200
+    exibidos = sem_compra[:limite_lista]
+    linhas = "\n".join(f"- {nome}" for nome in exibidos)
+    resposta = (
+        f"Considerando os registros de vendas em {mes_rotulo} até {data_base}, "
+        f"estes {len(sem_compra)} clientes do histórico não têm compra registrada neste mês:\n\n{linhas}"
+    )
+    if len(sem_compra) > limite_lista:
+        resposta += (
+            f"\n\nExibi os primeiros {limite_lista} de {len(sem_compra)} clientes para manter a resposta legível."
+        )
+    resposta += (
+        "\n\nObservação: a lista considera os clientes presentes no histórico de vendas recebido e "
+        "os registros de compra disponíveis até a data indicada."
+    )
+    return retorno(resposta, "calculado")
+
+
 def processar_pergunta(df, cols, pergunta, mapa, historico, gerar, etapa=None):
 
     """Planeja -> executa localmente -> responde.
@@ -1924,9 +2651,15 @@ def processar_pergunta(df, cols, pergunta, mapa, historico, gerar, etapa=None):
     aviso_etapa = etapa or (lambda _t: None)
 
     quadro = Quadro(df, cols)
+    # Esta pergunta exige comparar o universo de clientes com as vendas do mês;
+    # não cabe em um filtro simples de consulta. Resolva localmente antes do planejador.
+    consulta_clientes_mes = _saida_clientes_sem_compra_mes(quadro, pergunta)
+    if consulta_clientes_mes is not None:
+        return consulta_clientes_mes
+
     # Correspondência aproximada acontece antes das validações e da anonimização,
     # sempre na máquina local e somente contra valores categóricos da base.
-    pergunta_corrigida, correcoes_fuzzy, sugestao_fuzzy = corrigir_termos_similares(pergunta, quadro)
+    pergunta_corrigida, correcoes_fuzzy, sugestao_fuzzy, meta_sugestao_fuzzy = corrigir_termos_similares(pergunta, quadro)
     if sugestao_fuzzy:
         return {
             "resposta": sugestao_fuzzy,
@@ -1935,6 +2668,11 @@ def processar_pergunta(df, cols, pergunta, mapa, historico, gerar, etapa=None):
                 "rota": "validacao_local_similaridade",
                 "plano": [], "avisos": [], "resultados": [],
                 "correcoes_automaticas": 0,
+                "termo_sugerido": (meta_sugestao_fuzzy or {}).get("termo"),
+                "candidato_sugerido": (meta_sugestao_fuzzy or {}).get("candidato"),
+                "opcoes_sugeridas": (meta_sugestao_fuzzy or {}).get("opcoes", []),
+                "sugestao_ambigua": bool((meta_sugestao_fuzzy or {}).get("ambigua")),
+                "pergunta_original": pergunta,
             },
             "memoria": None,
         }
@@ -1987,6 +2725,7 @@ def processar_pergunta(df, cols, pergunta, mapa, historico, gerar, etapa=None):
     detalhes = {
         "pergunta_enviada": pergunta_segura, "plano": consultas, "avisos": avisos,
         "correcoes_automaticas": len(correcoes_fuzzy),
+        "termos_corrigidos": list(correcoes_fuzzy),
     }
 
     if not consultas:
@@ -2071,6 +2810,62 @@ def processar_pergunta(df, cols, pergunta, mapa, historico, gerar, etapa=None):
 
     }
 
+def resolver_confirmacao_validacao(resposta, pendente):
+    """Resolve a resposta a uma sugestão do corretor, sem chamar o modelo.
+
+    Retorna ação ``confirmada``, ``recusada`` ou ``nova_pergunta``.
+    """
+    texto = str(resposta or "").strip()
+    normalizada = normalizar(texto).strip(" .!?;:,")
+    if not isinstance(pendente, dict):
+        return {"acao": "nova_pergunta", "pergunta": texto, "correcoes": []}
+
+    opcoes = [str(x) for x in (pendente.get("opcoes") or [pendente.get("candidato")]) if x]
+    escolha = None
+    afirmativas = {
+        "sim", "isso", "isso mesmo", "correto", "correta", "exato", "exata",
+        "exatamente", "confirmo", "pode ser", "pode", "sim pode", "e isso",
+    }
+    negativas = {
+        "nao", "nao e esse", "nao e essa", "nao e isso", "negativo", "errado",
+        "errada", "nenhum", "nenhuma", "outro", "outra",
+    }
+
+    if not pendente.get("ambigua") and len(opcoes) == 1 and (
+        normalizada in afirmativas
+        or normalizada == normalizar(opcoes[0]).strip(" .!?;:,")
+        or normalizada.startswith("sim ")
+    ):
+        escolha = opcoes[0]
+    elif pendente.get("ambigua"):
+        for opcao in opcoes:
+            if normalizada == normalizar(opcao).strip(" .!?;:,"):
+                escolha = opcao
+                break
+        if escolha is None:
+            numero_opcao = re.fullmatch(r"(?:opcao\s*)?([1-3])", normalizada)
+            if numero_opcao and int(numero_opcao.group(1)) <= len(opcoes):
+                escolha = opcoes[int(numero_opcao.group(1)) - 1]
+
+    if escolha:
+        termo = str(pendente.get("termo", ""))
+        pergunta_original = str(pendente.get("pergunta_original", ""))
+        pergunta_corrigida = re.sub(
+            re.escape(termo), lambda _m: escolha, pergunta_original,
+            count=1, flags=re.IGNORECASE,
+        ) if termo else pergunta_original
+        return {
+            "acao": "confirmada",
+            "pergunta": pergunta_corrigida,
+            "correcoes": [(termo, escolha)] if termo else [],
+        }
+
+    if normalizada in negativas or normalizada.startswith("nao "):
+        return {"acao": "recusada", "pergunta": None, "correcoes": []}
+
+    return {"acao": "nova_pergunta", "pergunta": texto, "correcoes": []}
+
+
 # ============================================================
 
 # INTERFACE DO STREAMLIT
@@ -2135,6 +2930,7 @@ def exibir_assistente_ia(
         return
 
     chave_msgs, chave_mem, chave_map = f"ia_mensagens_{sufixo}", f"ia_memoria_{sufixo}", f"ia_pseudonimos_{sufixo}"
+    chave_pendente_validacao = f"ia_validacao_pendente_{sufixo}"
 
     st.session_state.setdefault(chave_msgs, [])
 
@@ -2293,6 +3089,7 @@ def exibir_assistente_ia(
                 st.session_state[chave_msgs] = []
                 st.session_state[chave_mem] = []
                 st.session_state[chave_map] = {}
+                st.session_state.pop(chave_pendente_validacao, None)
                 st.rerun()
             if minimizar:
                 st.session_state[chave_aberto] = False
@@ -2311,6 +3108,12 @@ def exibir_assistente_ia(
                     for mensagem in st.session_state[chave_msgs][-8:]:
                         with st.chat_message(mensagem["role"]):
                             st.markdown(mensagem["content"])
+                            if mensagem.get("correcoes_termos"):
+                                resumo_termos = " · ".join(
+                                    f'"{origem}" → "{destino}"'
+                                    for origem, destino in mensagem["correcoes_termos"]
+                                )
+                                st.caption(f"Termos validados: {resumo_termos}")
                             if mensagem.get("detalhes"):
                                 with st.expander("Ver consulta e dados utilizados"):
                                     st.caption(
@@ -2372,6 +3175,31 @@ def exibir_assistente_ia(
     if not pergunta:
         return
 
+    # O corretor valida somente nomes/termos da base; não corrige gramática.
+    pergunta_exibida = pergunta
+    correcoes_confirmadas = []
+    pendente = st.session_state.get(chave_pendente_validacao)
+    if pendente:
+        confirmacao = resolver_confirmacao_validacao(pergunta, pendente)
+        if confirmacao["acao"] == "confirmada":
+            pergunta = confirmacao["pergunta"]
+            correcoes_confirmadas = confirmacao["correcoes"]
+            st.session_state.pop(chave_pendente_validacao, None)
+        elif confirmacao["acao"] == "recusada":
+            st.session_state.pop(chave_pendente_validacao, None)
+            st.session_state[chave_msgs] = (
+                st.session_state[chave_msgs]
+                + [
+                    {"role": "user", "content": pergunta_exibida},
+                    {"role": "assistant", "content": "Tudo bem. Reescreva a pergunta com o nome correto e envie novamente."},
+                ]
+            )[-40:]
+            st.rerun()
+            return
+        else:
+            # Outra pergunta foi digitada: abandona a confirmação anterior.
+            st.session_state.pop(chave_pendente_validacao, None)
+
     if df_vendas.empty:
 
         st.warning("A base completa não contém registros para consulta.")
@@ -2429,7 +3257,7 @@ def exibir_assistente_ia(
         st.session_state[chave_msgs] = (
             st.session_state[chave_msgs]
             + [
-                {"role": "user", "content": pergunta},
+                {"role": "user", "content": pergunta_exibida, "correcoes_termos": correcoes_confirmadas},
                 {
                     "role": "assistant",
                     "content": (
@@ -2442,11 +3270,48 @@ def exibir_assistente_ia(
         st.rerun()
         return
 
-    # Verificar se a resposta e as consultas são válidas.
+    # Algumas consultas comparativas são calculadas por uma rota local determinística;
+    # seu resultado direto não passa pelo validador de planos do Gemini.
     detalhes = saida.get("detalhes") or {}
+    if detalhes.get("rota") == "clientes_sem_compra_mes":
+        st.session_state[chave_msgs] = (
+            st.session_state[chave_msgs]
+            + [
+                {"role": "user", "content": pergunta_exibida, "correcoes_termos": correcoes_confirmadas},
+                {"role": "assistant", "content": saida.get("resposta", "Não foi possível calcular a lista."), "detalhes": detalhes},
+            ]
+        )[-40:]
+        if saida.get("memoria"):
+            st.session_state[chave_mem] = (
+                st.session_state[chave_mem] + [saida["memoria"]]
+            )[-TURNOS_HISTORICO * 2:]
+        st.rerun()
+        return
+
+    if detalhes.get("rota") == "validacao_local_similaridade":
+        st.session_state[chave_pendente_validacao] = {
+            "pergunta_original": detalhes.get("pergunta_original", pergunta),
+            "termo": detalhes.get("termo_sugerido"),
+            "candidato": detalhes.get("candidato_sugerido"),
+            "opcoes": detalhes.get("opcoes_sugeridas") or [detalhes.get("candidato_sugerido")],
+            "ambigua": bool(detalhes.get("sugestao_ambigua")),
+        }
+        st.session_state[chave_msgs] = (
+            st.session_state[chave_msgs]
+            + [
+                {"role": "user", "content": pergunta_exibida},
+                {"role": "assistant", "content": saida.get("resposta", "Confirme o nome que você quis dizer.")},
+            ]
+        )[-40:]
+        st.rerun()
+        return
+
     plano = detalhes.get("plano") or []
     resultados = detalhes.get("resultados") or []
     avisos = detalhes.get("avisos") or []
+    correcoes_para_exibir = (
+        detalhes.get("termos_corrigidos") or []
+    ) + correcoes_confirmadas
 
     # Separar resultado vazio de erro de estrutura/plano.
     resultados_estruturados = [
@@ -2467,7 +3332,7 @@ def exibir_assistente_ia(
         st.session_state[chave_msgs] = (
             st.session_state[chave_msgs]
             + [
-                {"role": "user", "content": pergunta},
+                {"role": "user", "content": pergunta_exibida, "correcoes_termos": correcoes_para_exibir},
                 {"role": "assistant", "content": "nao foram encontrados registros"},
             ]
         )[-40:]
@@ -2487,7 +3352,7 @@ def exibir_assistente_ia(
         st.session_state[chave_msgs] = (
             st.session_state[chave_msgs]
             + [
-                {"role": "user", "content": pergunta},
+                {"role": "user", "content": pergunta_exibida, "correcoes_termos": correcoes_para_exibir},
                 {"role": "assistant", "content": "O resultado foi ocultado por privacidade porque corresponde a menos de 5 registros."},
             ]
         )[-40:]
@@ -2500,6 +3365,23 @@ def exibir_assistente_ia(
     )
 
     if resultado_invalido:
+        # Um plano vazio pode ser um esclarecimento legítimo do planejador, não uma falha.
+        # Mostrar a resposta original evita mascarar a pergunta de esclarecimento com erro genérico.
+        if not plano and str(saida.get("resposta") or "").strip():
+            st.session_state[chave_msgs] = (
+                st.session_state[chave_msgs]
+                + [
+                    {"role": "user", "content": pergunta_exibida, "correcoes_termos": correcoes_para_exibir},
+                    {"role": "assistant", "content": saida["resposta"]},
+                ]
+            )[-40:]
+            if saida.get("memoria"):
+                st.session_state[chave_mem] = (
+                    st.session_state[chave_mem] + [saida["memoria"]]
+                )[-TURNOS_HISTORICO * 2:]
+            st.rerun()
+            return
+
         # Manter as mensagens e limpar somente a memória contextual.
         st.session_state[chave_mem] = []
         st.session_state[chave_map] = {}
@@ -2509,7 +3391,7 @@ def exibir_assistente_ia(
         st.session_state[chave_msgs] = (
             st.session_state[chave_msgs]
             + [
-                {"role": "user", "content": pergunta},
+                {"role": "user", "content": pergunta_exibida, "correcoes_termos": correcoes_para_exibir},
                 {
                     "role": "assistant",
                     "content": (
@@ -2529,7 +3411,8 @@ def exibir_assistente_ia(
     st.session_state[chave_msgs] = (
         st.session_state[chave_msgs]
         + [
-            {"role": "user", "content": pergunta},
+            {"role": "user", "content": pergunta_exibida,
+             "correcoes_termos": correcoes_para_exibir},
             {
                 "role": "assistant",
                 "content": saida["resposta"],

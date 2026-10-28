@@ -667,8 +667,8 @@ def ir_para(aba, **filtros):
 
 
 def multiselect_persistente(rotulo, opcoes, chave):
-    """Multiselect que lembra a seleção. Valores que deixaram de existir nas opções são descartados;
-    se nada sobrar do que estava salvo, volta a selecionar tudo."""
+    """Multiselect persistente com atalho para selecionar todas as opções."""
+    opcoes = list(opcoes)
     salvo = st.session_state.get(chave)
     if salvo is None:
         st.session_state[chave] = list(opcoes)
@@ -677,6 +677,16 @@ def multiselect_persistente(rotulo, opcoes, chave):
         if salvo and not validos:
             validos = list(opcoes)
         st.session_state[chave] = validos
+
+    # O botão é único para cada filtro e atualiza o estado antes de criar o widget.
+    if st.button(
+        "Selecionar todos",
+        key=f"{chave}_selecionar_todos",
+        disabled=not opcoes,
+        help=f"Seleciona todas as opções de {rotulo.lower()}.",
+    ):
+        st.session_state[chave] = list(opcoes)
+
     return st.multiselect(rotulo, opcoes, key=chave)
 
 
@@ -2360,6 +2370,7 @@ if aba_ativa == ABA_PROJECOES:
             key="grafico_projecao_probabilistica_mensal",
         )
 
+        # A interpretação e as perguntas à IA são concentradas no painel flutuante.
         st.subheader("Projeção mês a mês")
         tabela_proj = previsoes_proj[[
             "Mês", "Previsão central (P50)", "Limite inferior 80% (P10)",
