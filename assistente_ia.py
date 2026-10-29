@@ -65,7 +65,6 @@ LIMITE_MAXIMO = 200          # máximo de linhas por consulta
 MAX_LINHAS_TOTAIS = 300      # máximo de linhas somando todas as consultas
 
 MAX_VALORES_LISTADOS = 40    # valores listados no esquema para dimensões pequenas
-MIN_REGISTROS_GRUPO_PRIVACIDADE = 5  # grupos menores não são enviados ao Gemini
 
 TURNOS_HISTORICO = 4         # turnos anteriores enviados ao planejador
 
@@ -168,10 +167,6 @@ REGRAS:
     devolva "consultas": [] e escreva em "esclarecimento" uma pergunta curta ao usuário,
 
     ou explique o que falta nos dados.
-
-11. Alguns grupos com menos de 5 registros serão ocultados por privacidade. Não tente contornar
-
-    essa regra com consultas adicionais ou combinações alternativas de dimensões.
 
 """
 
@@ -365,23 +360,36 @@ def formatar_moeda(valor):
 
 # ============================================================
 
-# LISTA PERMITIDA: cabeçalhos fora desta lista não são disponibilizados ao assistente.
-COLUNAS_PERMITIDAS = {normalizar(nome) for nome in (
-    "Classe Produto", "Cliente Gerencial", "Grupo Empresarial", "Empresa", "Ano-Mês", "Ano-Mes",
-    "Ano Fat.", "Mês Fat.", "Mes Fat.", "Trimestre", "Nº Pedido", "No Pedido", "Data Pedido",
-    "Produto", "Voltagem", "Qtde", "Quantidade", "Vlr unitário", "Vlr unitario",
-    "Vlr total dos produtos", "Data Faturamento", "IPI", "Valor Bruto da NF", "ST", "Total Bruto",
-    "Comissão Gerada", "Comissao Gerada", "Representante", "Tipo de Operação", "Tipo de Operacao",
-    "Departamento", "Vendedor atual do cadastro", "Gerente região Venda", "Gerente regiao Venda",
-    "Gerente região Cadastro", "Gerente regiao Cadastro", "Status Pedido", "Status Faturamento",
-    "Segmento", "Porte", "SKU", "Cidade", "Estado", "Região", "Regiao",
-)}
+# LISTA PERMITIDA: exatamente as colunas da base de vendas. Qualquer outro cabeçalho NUNCA é exposto ao
+# assistente. (CNPJ consta na base, mas é bloqueado por COLUNAS_SENSIVEIS/TERMOS_BLOQUEADOS.)
+COLUNAS_BASE = (
+    "Classe Produto", "Cliente Gerencial", "Grupo Empresarial", "Empresa", "Ano-Mês", "Ano Fat.", "Mês Fat.",
+    "Trimestre", "Nº Pedido", "Data Pedido", "CNPJ", "Cliente", "Produto", "Voltagem", "Qtde", "Vlr unitário",
+    "Vlr total dos produtos", "Data Faturamento", "N.F.", "IPI", "Valor Bruto da NF", "ST", "Total Bruto",
+    "Comissão Gerada", "Representante", "Tipo de Operação", "Departamento", "Vendedor atual do cadastro",
+    "Gerente região Venda", "Gerente região Cadastro", "Status Pedido", "Status Faturamento", "Segmento",
+    "Porte", "SKU", "Cidade", "Estado", "Região", "Frete", "Validação Dev. Terc", "Classe produto Marca",
+    "Sub Classe de produtos",
+)
+COLUNAS_PERMITIDAS = {normalizar(nome) for nome in COLUNAS_BASE if normalizar(nome) != "cnpj"}
+
+def coluna_formula(nome):
+    """A base traz uma coluna calculada cujo CABEÇALHO é a própria fórmula (com referências e nomes)."""
+    return str(nome).strip().startswith("=")
+
+def rotulo_coluna(nome):
+    """Rótulo seguro do cabeçalho para o esquema: fórmulas/cabeçalhos estranhos nunca vão ao Gemini."""
+    texto = str(nome).strip()
+    if coluna_formula(texto) or re.search(r"[=;()<>\"]", texto):
+        return "Classificação calculada (fórmula)"
+    return texto
+
 COLUNAS_TEMPO_PRESERVADAS = {normalizar(nome) for nome in (
-    "Ano-Mês", "Ano-Mes", "Ano Fat.", "Mês Fat.", "Mes Fat.", "Trimestre", "Data Pedido", "Data Faturamento",
+    "Ano-Mês", "Ano Fat.", "Mês Fat.", "Trimestre", "Data Pedido", "Data Faturamento",
 )}
 COLUNAS_VALOR_PRESERVADAS = {normalizar(nome) for nome in (
-    "Qtde", "Quantidade", "Vlr unitário", "Vlr unitario", "Vlr total dos produtos", "IPI",
-    "Valor Bruto da NF", "ST", "Total Bruto", "Comissão Gerada", "Comissao Gerada",
+    "Qtde", "Vlr unitário", "Vlr total dos produtos", "IPI", "Valor Bruto da NF", "ST", "Total Bruto",
+    "Comissão Gerada", "Frete",
 )}
 
 # Colunas auxiliares criadas localmente pelo painel_vendas.py.
@@ -396,29 +404,18 @@ COLUNAS_INTERNAS_PERMITIDAS = {
 # prefixo != None: dado pessoal/comercial sensível, sempre enviado como "Prefixo N".
 
 DIMENSOES_TEXTO = {
-
     "cliente": {"rotulo": "cliente gerencial", "aliases": ["Cliente Gerencial", "Cliente"], "prefixo": "Cliente"},
-
-    "produto": {"rotulo": "produto/descrição comercial", "aliases": ["Produto", "Descrição Produto", "Descricao Produto", "Nome Produto", "Nome do Produto", "Descrição", "Descricao", "Produto/Descrição", "Produto/Descricao"], "prefixo": "Dado"},
-
-    "sku": {"rotulo": "código SKU do produto", "aliases": ["SKU", "Código Produto", "Codigo Produto", "Código do Produto", "Codigo do Produto", "Cod Produto", "Cod. Produto", "Cod do Produto", "Cod. do Produto", "Código SKU", "Codigo SKU", "Cod SKU", "Cod. SKU", "Referência", "Referencia", "Código Item", "Codigo Item", "Cod Item", "Cod. Item"], "prefixo": "Dado"},
-
-    "vendedor": {"rotulo": "vendedor", "aliases": ["Vendedor", "Representante", "Vendedor atual do cadastro"], "prefixo": "Vendedor"},
-
+    "produto": {"rotulo": "produto/descrição comercial", "aliases": ["Produto"], "prefixo": "Dado"},
+    "sku": {"rotulo": "código SKU do produto", "aliases": ["SKU"], "prefixo": "Dado"},
+    "vendedor": {"rotulo": "vendedor atual do cadastro", "aliases": ["Vendedor atual do cadastro"], "prefixo": "Vendedor"},
     "representante": {"rotulo": "representante", "aliases": ["Representante"], "prefixo": "Representante"},
-
     "vendedor_cadastro": {"rotulo": "vendedor atual do cadastro", "aliases": ["Vendedor atual do cadastro"], "prefixo": "Vendedor"},
-
-    "gerente_regiao": {"rotulo": "gerente de região (cadastro)", "aliases": ["Gerente região Cadastro", "Gerente região"], "prefixo": "Gerente"},
-
+    "gerente_regiao": {"rotulo": "gerente de região (cadastro)", "aliases": ["Gerente região Cadastro"], "prefixo": "Gerente"},
+    "gerente_venda": {"rotulo": "gerente de região (venda)", "aliases": ["Gerente região Venda"], "prefixo": "Gerente"},
     "segmento": {"rotulo": "segmento", "aliases": ["Segmento"], "prefixo": "Dado"},
-
     "empresa": {"rotulo": "empresa", "aliases": ["Empresa"], "prefixo": "Dado"},
-
     "status_faturamento": {"rotulo": "status de faturamento", "aliases": ["Status Faturamento"], "prefixo": "Dado"},
-
     "departamento": {"rotulo": "departamento", "aliases": ["Departamento"], "prefixo": "Dado"},
-
 }
 
 # Somente campos com dados pessoais, credenciais ou identificadores financeiros são bloqueados.
@@ -479,6 +476,58 @@ REGEX_PSEUDONIMO = re.compile(r"^(cliente|vendedor|representante|gerente|dado) \
 
 REGEX_PSEUDONIMO_TEXTO = re.compile(r"(?<!\w)(Cliente|Vendedor|Representante|Gerente|Dado) (\d+)(?!\w)", re.IGNORECASE)
 
+# ------------------------------------------------------------
+# CAMADAS EXTRAS DE ANONIMIZAÇÃO (nomes parciais, colunas ocultas e trava final)
+# ------------------------------------------------------------
+PREFIXOS_NOME_PROPRIO = ("Cliente", "Vendedor", "Representante", "Gerente")
+COLUNAS_NOMES_EMPRESA = {normalizar(n) for n in ("Cliente", "Grupo Empresarial", "Empresa")}
+LIMITE_AMBIGUIDADE_NOME = 5   # token de nome presente em mais cadastros que isso = palavra genérica
+MIN_LETRAS_TOKEN_NOME = 4
+
+# Palavras comuns de perguntas/análises e de razões sociais: nunca tratadas como "nome próprio".
+PALAVRAS_GENERICAS = {normalizar(p) for p in """
+faturamento faturado faturada faturados faturadas faturar vendas venda vendeu vendido vendida vendidos
+vender valor valores total totais soma somar quantidade quantidades unidade unidades preco precos
+medio media medias maior maiores menor menores ultimo ultima ultimos ultimas primeiro primeira
+compra compras comprou comprado compraram pedido pedidos cliente clientes produto produtos
+vendedor vendedores representante representantes gerente gerentes empresa empresas segmento
+segmentos regiao regioes estado estados cidade cidades trimestre trimestres semestre semestres
+mensal mensais anual anuais ano anos mes meses periodo periodos evolucao comparar comparacao
+comparativo participacao ranking lista listar liste mostre mostra mostrar quais qual quanto
+quantos quantas como onde quem para entre desde sobre todos todas cada mais menos passado
+passada atual atuais este esta esse essa isso hoje ontem janeiro fevereiro marco abril maio
+junho julho agosto setembro outubro novembro dezembro segunda terca quarta quinta sexta sabado
+domingo dado dados item itens codigo sku classe departamento status voltagem porte grupo
+comissao imposto impostos bruto liquido nota fiscal tipo operacao data datas dia dias semana
+semanas diario diaria acumulado crescimento queda variacao percentual porcentagem resultado
+resultados consulta base geral nesse nessa desse dessa dele dela deles delas foram sao teve
+tinha houve fizeram temos ainda tambem apenas somente sempre nunca outro outra outros outras
+mesmo mesma entao porque quando enquanto durante depois antes apos cerca removido email
+telefone documento informacao informado
+ltda eireli epp sociedade anonima comercio comercial industria industrial servicos servico
+participacoes distribuidora distribuicao importacao exportacao brasil brasileira holding matriz
+filial empreendimentos representacoes equipamentos maquinas ferramentas materiais solucoes
+sistemas tecnologia transportes transportadora construcoes construtora engenharia agropecuaria
+agricola agro
+""".split()}
+
+def _tokens_nome(nome):
+    """Palavras (só letras, 4+) de um nome que ajudam a identificá-lo; ignora termos genéricos."""
+    saida = []
+    for tok in re.findall(r"[^\W\d_]{%d,}" % MIN_LETRAS_TOKEN_NOME, str(nome)):
+        tok = normalizar(tok)
+        if len(tok) >= MIN_LETRAS_TOKEN_NOME and tok not in PALAVRAS_GENERICAS:
+            saida.append(tok)
+    return saida
+
+def _parece_nome(valor):
+    """Valor textual com cara de nome (evita tratar 'Sim', números ou datas como nomes)."""
+    v = str(valor).strip()
+    if not (MIN_LETRAS_TOKEN_NOME <= len(v) <= 120) or not any(c.isalpha() for c in v):
+        return False
+    n = normalizar(v)
+    return n not in PLACEHOLDERS and n not in PALAVRAS_GENERICAS
+
 def resolver_colunas(df, explicitas):
 
     """Descobre as colunas de cada dimensão. Parâmetros explícitos têm prioridade; senão, nomes padrão."""
@@ -503,13 +552,13 @@ def resolver_colunas(df, explicitas):
 
     cols["valor"] = (localizar_coluna_opcional(df, [ev]) if ev else None) or localizar_coluna_opcional(
 
-        df, ["Vlr total dos produtos", "Valor Total (Sem IPI)", "Valor Bruto da NF"]
+        df, ["Vlr total dos produtos", "Valor Bruto da NF"]
 
     )
 
     eq = explicitas.get("qtd")
 
-    cols["qtd"] = (localizar_coluna_opcional(df, [eq]) if eq else None) or localizar_coluna_opcional(df, ["Qtde", "Quantidade"])
+    cols["qtd"] = (localizar_coluna_opcional(df, [eq]) if eq else None) or localizar_coluna_opcional(df, ["Qtde"])
 
     ed = explicitas.get("data")
 
@@ -576,7 +625,10 @@ def resolver_colunas(df, explicitas):
     for indice, nome in enumerate(df.columns, start=1):
         cabecalho = normalizar(nome)
         # Lista permitida: colunas não listadas não são expostas ao assistente.
-        if cabecalho not in COLUNAS_PERMITIDAS or nome in reservadas or coluna_bloqueada(nome):
+        if (
+            (cabecalho not in COLUNAS_PERMITIDAS and not coluna_formula(nome))
+            or nome in reservadas or coluna_bloqueada(nome)
+        ):
             continue
         chave = f"campo_{indice}"
         dinamicas[chave] = nome
@@ -592,6 +644,28 @@ def resolver_colunas(df, explicitas):
     cols["_dinamicas"] = dinamicas
     cols["_prefixos_sensiveis"] = prefixos_sensiveis
     cols["_numericas"] = numericas
+
+    # Colunas de texto NÃO expostas ao assistente (fora da lista permitida, como "Razão Social",
+    # "Nome Fantasia", "Vendedor"...) são lidas só LOCALMENTE para anonimizar a pergunta: se o usuário
+    # digitar um nome que existe nelas, ele vira "Dado N" antes do envio. Nunca entram no esquema.
+    expostas = set(dinamicas.values()) | reservadas
+    ja_cobertas = {c for lista in cols["_colunas_anonimizacao"].values() for c in lista}
+    ocultas = []
+    for nome in df.columns:
+        if nome in expostas or nome in ja_cobertas:
+            continue
+        serie = df[nome]
+        if isinstance(serie, pd.DataFrame):
+            serie = serie.iloc[:, 0]
+        if (pd.api.types.is_numeric_dtype(serie) or pd.api.types.is_bool_dtype(serie)
+                or pd.api.types.is_datetime64_any_dtype(serie)):
+            continue
+        ocultas.append(nome)
+    if ocultas:
+        cols["_colunas_anonimizacao"]["Dado"] = sorted(
+            set(cols["_colunas_anonimizacao"].get("Dado", [])) | set(ocultas)
+        )
+    cols["_colunas_ocultas"] = set(ocultas)
     return cols
 
 # ============================================================
@@ -666,10 +740,14 @@ def anonimizar_pergunta(pergunta, nomes_por_prefixo, mapa):
 
             nome = str(nome).strip()
 
-            if len(nome) >= 2 and nome not in vistos and normalizar(nome) not in PLACEHOLDERS:
-
+            if (
+                len(nome) >= 2 and nome not in vistos and normalizar(nome) not in PLACEHOLDERS
+                # números curtos (anos, quantidades) não são identificadores: "2026" não pode virar "Dado 1"
+                and not re.fullmatch(r"\d{1,4}", nome)
+                # categorias que são palavras comuns de pergunta ("Médio" em "preço médio") ficam como digitadas
+                and not (prefixo == "Dado" and normalizar(nome) in PALAVRAS_GENERICAS)
+            ):
                 vistos.add(nome)
-
                 candidatos.append((nome, prefixo))
 
     candidatos.sort(key=lambda item: len(item[0]), reverse=True)
@@ -831,6 +909,100 @@ class Quadro:
 
         return chave
 
+def _valores_coluna_anonimizacao(quadro, coluna):
+    """Valores reais de uma coluna usada só para anonimizar (bloqueada ou oculta)."""
+    serie = quadro._df[coluna]
+    if isinstance(serie, pd.DataFrame):
+        serie = serie.iloc[:, 0]
+    valores = serie.dropna().astype(str).str.strip().unique()
+    if coluna in quadro.cols.get("_colunas_ocultas", ()):
+        valores = [v for v in valores if _parece_nome(v)]
+    return valores
+
+def _nomes_proprios(quadro, nomes_por_prefixo):
+    """[(prefixo, nome)] de clientes, vendedores, representantes, gerentes e colunas ocultas/bloqueadas."""
+    saida, vistos = [], set()
+
+    def adicionar(prefixo, nome):
+        nome = str(nome).strip()
+        if len(nome) >= 2 and nome not in vistos and normalizar(nome) not in PLACEHOLDERS:
+            vistos.add(nome)
+            saida.append((prefixo, nome))
+
+    for prefixo in PREFIXOS_NOME_PROPRIO:
+        for nome in nomes_por_prefixo.get(prefixo, ()):
+            adicionar(prefixo, nome)
+    for coluna in quadro.cols.get("_colunas_anonimizacao", {}).get("Dado", ()):
+        if coluna in quadro._df.columns:
+            for nome in _valores_coluna_anonimizacao(quadro, coluna):
+                adicionar("Dado", nome)
+    # Colunas expostas (como "Dado N") que guardam nomes de empresas: também protegidas por palavra parcial.
+    origens = list(quadro.cols.get("_dinamicas", {}).values()) + [quadro.cols.get("empresa")]
+    for coluna in dict.fromkeys(o for o in origens if o):
+        if normalizar(coluna) in COLUNAS_NOMES_EMPRESA and coluna in quadro._df.columns:
+            for nome in _valores_coluna_anonimizacao(quadro, coluna):
+                adicionar("Dado", nome)
+    return saida
+
+def anonimizar_nomes_parciais(pergunta_segura, nomes_proprios, mapa):
+    """2ª camada: nomes digitados de forma PARCIAL (ex.: só "Bazzo" para "Bazzo Variedades Ltda").
+
+    - palavra que identifica UM único cadastro -> vira o pseudônimo desse cadastro;
+    - palavra que identifica vários cadastros -> nada é enviado; devolve a ambiguidade p/ o usuário;
+    - palavras genéricas (ltda, comércio, termos de pergunta) ou presentes em muitos cadastros são ignoradas.
+    Retorna (texto, [(nome, identificador)], [(termo, [nomes])]).
+    """
+    texto = str(pergunta_segura)
+    por_nome = {}
+    for prefixo, nome in nomes_proprios:        # mesmo nome em 2 colunas = mesma pessoa/empresa
+        por_nome.setdefault(nome, prefixo)
+    indice = {}
+    for nome, prefixo in por_nome.items():
+        if "@" in nome:   # e-mails já são removidos por regex; não gerar tokens a partir deles
+            continue
+        for tok in set(_tokens_nome(nome)):
+            indice.setdefault(tok, {})[nome] = prefixo
+    if not indice:
+        return texto, [], []
+
+    trocas, ambiguos = [], []
+    for m in re.finditer(r"[^\W\d_]{%d,}" % MIN_LETRAS_TOKEN_NOME, texto):
+        entidades = indice.get(normalizar(m.group(0)))
+        if entidades:
+            # Colunas ocultas (ex.: Razão Social) costumam ser outra grafia do mesmo cadastro visível:
+            # havendo cadastro visível, ele decide; a grafia oculta é trocada junto, sem ir à IA.
+            visiveis = {n: p for n, p in entidades.items() if p != "Dado"}
+            entidades = visiveis or entidades
+        if not entidades or len(entidades) > LIMITE_AMBIGUIDADE_NOME:
+            continue
+        if len(entidades) == 1:
+            nome, prefixo = next(iter(entidades.items()))
+            trocas.append((m.start(), m.end(), prefixo, nome))
+        else:
+            ambiguos.append((m.group(0), sorted(entidades)))
+    if ambiguos:
+        return texto, [], ambiguos
+
+    encontrados = []
+    for ini, fim, prefixo, nome in sorted(trocas, reverse=True):
+        identificador = _pseudonimo(mapa, prefixo, nome)
+        texto = texto[:ini] + identificador + texto[fim:]
+        encontrados.append((nome, identificador))
+    # "Bazzo Silva" -> "Cliente 1 Cliente 1" -> "Cliente 1"
+    texto = re.sub(r"((?:Cliente|Vendedor|Representante|Gerente|Dado) \d+)(?:\s+\1)+", r"\1", texto)
+    return texto, encontrados, []
+
+def _preparar_guarda(nomes_proprios):
+    return sorted({_normalizar_posicional(n) for _p, n in nomes_proprios if _parece_nome(n)}, key=len, reverse=True)
+
+def _nome_real_no_texto(texto, guarda):
+    """Trava final: True se algum nome real conhecido aparece no texto que iria ao Gemini."""
+    pn = _normalizar_posicional(texto)
+    for nn in guarda:
+        if nn in pn and re.search(r"(?<!\w)" + re.escape(nn) + r"(?!\w)", pn):
+            return True
+    return False
+
 def nomes_para_anonimizar(quadro):
 
     """{'Cliente': {nomes}, 'Vendedor': {...}} com os nomes reais presentes nos dados."""
@@ -842,7 +1014,7 @@ def nomes_para_anonimizar(quadro):
     for prefixo, colunas in quadro.cols.get("_colunas_anonimizacao", {}).items():
         for coluna in colunas:
             if coluna in quadro._df.columns:
-                valores = quadro._df[coluna].dropna().astype(str).str.strip().unique()
+                valores = _valores_coluna_anonimizacao(quadro, coluna)
                 saida.setdefault(prefixo, set()).update(valores)
 
     for dim, cfg in DIMENSOES_TEXTO.items():
@@ -864,7 +1036,11 @@ def nomes_para_anonimizar(quadro):
 
 def montar_esquema(quadro):
 
-    """Descrição dos dados enviada ao planejador. Não contém linhas nem nomes de pessoas/clientes."""
+    """Esquema agregado enviado ao planejador; nunca inclui linhas nem valores categóricos reais.
+
+    Os dados completos e os valores originais permanecem no DataFrame local. Ao Gemini
+    são enviados apenas metadados estruturais, contagens e identificadores pseudonimizados.
+    """
 
     cols = quadro.cols
 
@@ -912,19 +1088,22 @@ def montar_esquema(quadro):
 
         dims[dim] = descricao
 
-        if not cfg["prefixo"] and dim != "produto":
-
-            unicos = quadro._df[cols[dim]].dropna().astype(str).str.strip().unique().tolist()
-
-            valores_possiveis[dim] = sorted(unicos)[:MAX_VALORES_LISTADOS] if len(unicos) <= MAX_VALORES_LISTADOS else f"{len(unicos)} valores distintos"
+        # Nunca enviar valores categóricos reais ao modelo. Mesmo quando uma dimensão
+        # não tiver prefixo configurado por algum motivo, o esquema contém apenas a
+        # contagem de valores distintos; os dados completos e os nomes reais ficam locais.
+        unicos = quadro._df[cols[dim]].dropna().astype(str).str.strip().unique()
+        valores_possiveis[dim] = f"{len(unicos)} valores distintos; valores anonimizados e não listados"
 
     for dim, origem in cols.get("_dinamicas", {}).items():
         prefixo = cols.get("_prefixos_sensiveis", {}).get(dim)
-        dims[dim] = f"coluna {origem!r} (use o ID {dim})" + (f' (valores pseudonimizados como "{prefixo} N")' if prefixo else "")
+        dims[dim] = f"coluna {rotulo_coluna(origem)!r} (use o ID {dim})" + (f' (valores pseudonimizados como "{prefixo} N")' if prefixo else "")
         serie = quadro._df[origem].dropna().astype(str).str.strip()
         unicos = serie.unique().tolist()
         if prefixo:
             valores_possiveis[dim] = f"{len(unicos)} valores distintos, pseudonimizados; use o identificador citado na pergunta"
+        elif normalizar(origem) in COLUNAS_VALOR_PRESERVADAS or "data" in normalizar(origem):
+            # Valores monetários/quantidades e datas exatas nunca são listados individualmente.
+            valores_possiveis[dim] = f"{len(unicos)} valores distintos"
         elif len(unicos) <= MAX_VALORES_LISTADOS:
             valores_possiveis[dim] = [sanitizar_valor_textual(v) for v in unicos]
         else:
@@ -1379,24 +1558,6 @@ def executar_consulta(quadro, consulta, mapa, limite_maximo=LIMITE_MAXIMO):
         resultado.update({"linhas_totais": 0, "linhas_retornadas": 0, "truncado": False, "linhas": []})
         return resultado
 
-    # Se a pergunta filtra uma dimensão comercial específica, não exponha totais
-    # de grupos com menos de cinco registros. Diferenciamos esse bloqueio de zero
-    # resultados reais para não exibir uma mensagem enganosa de ausência de vendas.
-    filtros_comerciais = [f for f in filtros if f["dimensao"] not in FILTROS_TEMPO]
-    if len(dados) < MIN_REGISTROS_GRUPO_PRIVACIDADE and filtros_comerciais:
-        resultado["totais_do_filtro"] = {
-            "registros": None, "faturamento": None,
-            **({"quantidade": None} if quadro.tem_quantidade else {}),
-        }
-        resultado["avisos"] = avisos + [
-            f"Resultado ocultado por privacidade: menos de {MIN_REGISTROS_GRUPO_PRIVACIDADE} registros correspondem aos critérios."
-        ]
-        resultado.update({
-            "linhas_totais": 0, "linhas_retornadas": 0, "truncado": False,
-            "linhas": [], "oculto_por_privacidade": True,
-        })
-        return resultado
-
     chaves = [quadro.coluna(d) for d in agrupar]
 
     if consulta["somente_ultima_data"]:
@@ -1439,10 +1600,6 @@ def executar_consulta(quadro, consulta, mapa, limite_maximo=LIMITE_MAXIMO):
 
         spec["data_ultima"] = ("d", "max")
 
-    # Contagem de suporte calculada localmente para impedir a divulgação de grupos muito pequenos.
-    if chaves:
-        spec["_registros_privacidade"] = ("v", "size")
-
     for dim, origem in quadro.cols.get("_numericas", {}).items():
         coluna_n = f"n_{dim}"
         if f"soma_{dim}" in metricas:
@@ -1468,16 +1625,6 @@ def executar_consulta(quadro, consulta, mapa, limite_maximo=LIMITE_MAXIMO):
 
     if chaves:
         agg = agg.rename(columns=dict(zip(chaves, agrupar)))
-        # A regra de privacidade deve ser executada, não apenas descrita no prompt.
-        linhas_antes_privacidade = len(agg)
-        agg = agg[agg["_registros_privacidade"] >= MIN_REGISTROS_GRUPO_PRIVACIDADE].copy()
-        grupos_ocultados = linhas_antes_privacidade - len(agg)
-        agg = agg.drop(columns=["_registros_privacidade"])
-        if grupos_ocultados:
-            avisos.append(
-                f"{grupos_ocultados} grupo(s) com menos de "
-                f"{MIN_REGISTROS_GRUPO_PRIVACIDADE} registros foram ocultados por privacidade."
-            )
     else:
         agg = agg.drop(columns=["_tudo"])
 
@@ -1826,7 +1973,14 @@ def aplicar_fuzzy_base(pergunta, quadro):
             ini, fim = tokens[inicio].start(), tokens[fim_indice].end()
             trecho = texto[ini:fim]
             chave_trecho = normalizar(trecho)
-            if len(chave_trecho) >= 3 and chave_trecho not in PLACEHOLDERS:
+            # Se o trecho já corresponde exatamente a um valor existente na base,
+            # não o envie ao fuzzy: isso impede trocar um cliente correto
+            # (ex.: "Bazzo Variedades") por outro nome parecido (ex.: "Agro Variedades").
+            if (
+                len(chave_trecho) >= 3
+                and chave_trecho not in PLACEHOLDERS
+                and chave_trecho not in valores
+            ):
                 spans.append((ini, fim, chave_trecho, tamanho))
 
     melhores = []
@@ -1907,14 +2061,55 @@ def processar_pergunta(df, cols, pergunta, mapa, historico, gerar, etapa=None):
             "memoria": None,
         }
 
-    pergunta_segura, _encontrados = anonimizar_pergunta(pergunta, nomes_para_anonimizar(quadro), mapa)
+    nomes_por_prefixo = nomes_para_anonimizar(quadro)
+    pergunta_segura, _encontrados = anonimizar_pergunta(pergunta, nomes_por_prefixo, mapa)
+
+    # 2ª camada: nomes parciais (ex.: só "Bazzo"). Ambíguo -> nada é enviado à IA.
+    nomes_proprios = _nomes_proprios(quadro, nomes_por_prefixo)
+    pergunta_segura, _parciais, _ambiguos = anonimizar_nomes_parciais(pergunta_segura, nomes_proprios, mapa)
+    if _ambiguos:
+        termo, candidatos = _ambiguos[0]
+        lista = "; ".join(candidatos[:6]) + ("; ..." if len(candidatos) > 6 else "")
+        texto = (
+            f'O termo "{termo}" corresponde a mais de um cadastro ({lista}). '
+            "Por segurança, nada foi enviado à IA. Digite o nome completo para continuar."
+        )
+        return {
+            "resposta": texto, "resposta_segura": texto, "mensagem_usuario": texto,
+            "detalhes": {"rota": "validacao_local", "plano": [], "avisos": [], "resultados": []},
+            "memoria": None,
+        }
+    _encontrados = list(_encontrados) + list(_parciais)
+
+    # Trava final: se, por qualquer caminho, um nome real chegar ao texto de saída, o envio é abortado.
+    _guarda = _preparar_guarda(nomes_proprios)
+    _gerar_original = gerar
+
+    def gerar(prompt, sistema, json_mode):
+        if _nome_real_no_texto(prompt, _guarda):
+            raise RuntimeError(
+                "Envio bloqueado por segurança: um nome real de cliente, vendedor ou cadastro foi "
+                "detectado no texto que iria para a IA. Nada foi enviado."
+            )
+        return _gerar_original(prompt, sistema, json_mode)
+
+    # Mantém localmente quais clientes foram identificados na pergunta. Depois da
+    # validação do plano, o filtro do cliente será imposto pelo código, mesmo que a IA
+    # se esqueça de incluí-lo. Isso impede que uma pergunta sobre um cliente específico
+    # retorne faturamento/quantidade da base inteira.
+    clientes_mencionados = list(dict.fromkeys(
+        identificador
+        for _nome, identificador in _encontrados
+        if str(identificador).casefold().startswith("cliente ")
+    ))
 
     esquema = montar_esquema(quadro)
 
     # Rota rápida: perguntas inequívocas de total geral são calculadas localmente.
     # A IA continua sendo consultada para redigir a resposta, mas economizamos a chamada
     # de planejamento. Não há base estática, cache de resultados nem reutilização de histórico.
-    consulta_rapida = _consulta_rapida_sem_filtros(pergunta, quadro)
+    # Pergunta com nome/código anonimizado ("Cliente 1", "Dado 2") exige filtro: nunca usa a rota de total geral.
+    consulta_rapida = None if _encontrados else _consulta_rapida_sem_filtros(pergunta, quadro)
     if consulta_rapida is not None:
         aviso_etapa("Calculando diretamente os dados...")
         consultas = [consulta_rapida]
@@ -1948,6 +2143,30 @@ def processar_pergunta(df, cols, pergunta, mapa, historico, gerar, etapa=None):
         texto_plano = gerar(prompt_planejador, INSTRUCOES_PLANEJADOR, True)
         consultas, avisos, esclarecimento = validar_plano(_extrair_json(texto_plano), cols, quadro.tem_data)
         detalhes = {"rota": "planejamento_ia", "pergunta_enviada": pergunta_segura, "plano": consultas, "avisos": avisos}
+
+    # Defesa local: se a pergunta identificou um cliente da base, todas as consultas
+    # devem ser filtradas por esse cliente. A IA não pode transformar a solicitação em
+    # uma consulta geral omitindo o filtro. As demais validações do plano permanecem.
+    if clientes_mencionados:
+        if not cols.get("cliente"):
+            texto = "Não foi possível consultar esse cliente porque a base não disponibiliza uma dimensão de cliente filtrável."
+            return {
+                "resposta": texto,
+                "resposta_segura": texto,
+                "detalhes": {"rota": "validacao_local", "pergunta_enviada": pergunta_segura, "plano": [], "avisos": [texto], "resultados": []},
+                "memoria": None,
+            }
+        for consulta in consultas:
+            consulta["filtros"] = [
+                f for f in consulta.get("filtros", [])
+                if f.get("dimensao") != "cliente"
+            ]
+            consulta["filtros"].append({
+                "dimensao": "cliente",
+                "operador": "igual",
+                "valores": clientes_mencionados,
+            })
+        avisos.append("Filtro de cliente aplicado localmente para garantir que os resultados correspondam ao cliente mencionado.")
 
     detalhes = {"pergunta_enviada": pergunta_segura, "plano": consultas, "avisos": avisos}
 
@@ -2436,21 +2655,13 @@ def exibir_assistente_ia(
         st.rerun()
         return
 
-    resultados_ocultos = bool(resultados_estruturados) and all(
-        bool(r.get("oculto_por_privacidade"))
-        or (
-            isinstance(r.get("linhas"), list) and not r.get("linhas")
-            and isinstance(r.get("avisos"), list)
-            and any("privacidade" in str(a).casefold() for a in r.get("avisos", []))
-        )
-        for r in resultados_estruturados
-    )
-    if resultados_ocultos:
+    mensagem_local = saida.get("mensagem_usuario")
+    if mensagem_local:
         st.session_state[chave_msgs] = (
             st.session_state[chave_msgs]
             + [
                 {"role": "user", "content": pergunta},
-                {"role": "assistant", "content": "O resultado foi ocultado por privacidade porque corresponde a menos de 5 registros."},
+                {"role": "assistant", "content": mensagem_local},
             ]
         )[-40:]
         st.rerun()
