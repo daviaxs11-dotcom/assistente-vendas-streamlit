@@ -1927,7 +1927,25 @@ def processar_pergunta(df, cols, pergunta, mapa, historico, gerar, etapa=None):
     else:
         # Rota completa: a IA planeja a consulta com base na pergunta atual.
         aviso_etapa("Entendendo a pergunta...")
-        texto_plano = gerar(montar_prompt_planejador(pergunta_segura, esquema, historico), INSTRUCOES_PLANEJADOR, True)
+        prompt_planejador = montar_prompt_planejador(pergunta_segura, esquema, historico)
+        # Quando a pergunta contém somente um código alfanumérico (ex.: BP500),
+        # instrui o planejador a procurar em todas as dimensões plausíveis disponíveis,
+        # pois o identificador pode estar em SKU, código do produto ou descrição.
+        identificador_isolado = re.fullmatch(
+            r"\s*(?=[A-Za-z0-9._/-]*[A-Za-z])(?=[A-Za-z0-9._/-]*[0-9])[A-Za-z0-9][A-Za-z0-9._/-]{2,}\s*",
+            str(pergunta or ""),
+        )
+        if identificador_isolado:
+            prompt_planejador += (
+                "\n\nINSTRUÇÃO ESPECIAL PARA CÓDIGO ISOLADO: a pergunta contém apenas um "
+                "identificador alfanumérico. Não presuma que ele esteja somente em SKU. "
+                "Crie consultas separadas, com operador 'igual', para cada dimensão disponível "
+                "que possa guardar esse identificador: priorize 'sku' e 'produto' e inclua "
+                "também campos adicionais (campo_N) cujo cabeçalho indique código, referência, "
+                "item ou descrição, se existirem no esquema. Use o mesmo identificador em cada "
+                "consulta, respeitando o limite de consultas e todas as regras do esquema."
+            )
+        texto_plano = gerar(prompt_planejador, INSTRUCOES_PLANEJADOR, True)
         consultas, avisos, esclarecimento = validar_plano(_extrair_json(texto_plano), cols, quadro.tem_data)
         detalhes = {"rota": "planejamento_ia", "pergunta_enviada": pergunta_segura, "plano": consultas, "avisos": avisos}
 
