@@ -632,8 +632,9 @@ ABA_CLIENTE = "Vendas por cliente"
 ABA_ITENS = "Itens por segmento"
 ABA_PRECO = "Preço médio mensal"
 ABA_DADOS = "Conferência dos dados"
+ABA_SEM_COMPRA = "Clientes sem compra no mês atual"
 ABA_PROJECOES = "Projeções mensais"
-ABAS = [ABA_VENDEDOR, ABA_CLIENTE, ABA_ITENS, ABA_PRECO, ABA_PROJECOES, ABA_DADOS]
+ABAS = [ABA_VENDEDOR, ABA_CLIENTE, ABA_ITENS, ABA_PRECO, ABA_PROJECOES, ABA_SEM_COMPRA, ABA_DADOS]
 
 
 # Filtros de cada aba que ficam salvos na sessão ao trocar de seção.
@@ -644,6 +645,7 @@ CHAVES_PERSISTENTES = [
     "f_vendedor_cliente", "f_cliente", "tempo_cliente", "cliente_produto", "top_prod_cliente",
     "f_vendedor_segmento", "f_cliente_segmento", "f_produto_segmento", "metrica_segmento", "top_segmento",
     "f_vendedor_preco", "f_cliente_preco", "f_segmento_preco", "f_produto_preco", "top_produtos_preco",
+    "f_vendedor_sem_compra", "f_cliente_sem_compra",
     "detalhe_produto_preco", "detalhe_mes_preco",
 ]
 
@@ -1669,6 +1671,7 @@ _rotulos_abas = {
     ABA_ITENS: "Itens por segmento",
     ABA_PRECO: "Preço médio mensal",
     ABA_PROJECOES: "Projeções mensais",
+    ABA_SEM_COMPRA: "Clientes sem compra",
     ABA_DADOS: "Conferência dos dados",
 }
 aba_ativa = st.radio(
@@ -3206,6 +3209,275 @@ if aba_ativa == ABA_PRECO:
                 tabela_det[colunas_det], use_container_width=True, hide_index=True,
                 column_config={"Vs. média do mês (%)": st.column_config.NumberColumn(format="%.2f%%")},
             )
+
+
+if aba_ativa == ABA_SEM_COMPRA:
+    st.subheader("Desempenho dos clientes sem compra no mês atual")
+    hoje_local = datetime.now(ZoneInfo("America/Sao_Paulo")).date()
+    inicio_mes = pd.Timestamp(hoje_local.replace(day=1))
+    inicio_proximo_mes = inicio_mes + pd.offsets.MonthBegin(1)
+    rotulo_mes = inicio_mes.strftime("%m/%Y")
+
+    if not col_cliente:
+        st.info("Adicione a coluna Cliente Gerencial ou Cliente para usar esta análise.")
+    elif "_data" not in df.columns:
+        st.info("Não foi possível identificar a data das compras.")
+    else:
+        # Mantém o histórico completo para identificar corretamente quem não comprou no mês.
+        # Os filtros globais de empresa/departamento/gerente/operação continuam aplicados.
+        base_historica = df.copy()
+        for aplicar_filtro in filtros_aplicados:
+            base_historica = aplicar_filtro(base_historica)
+
+        base_historica = base_historica[
+            base_historica["_cliente"].notna()
+            & base_historica["_cliente"].astype(str).str.strip().ne("")
+            & base_historica["_cliente"].astype(str).ne("(Não informado)")
+        ].copy()
+
+        st.caption(
+            f"Análise referente a {rotulo_mes}. O período global de datas não limita esta análise; "
+            "os filtros globais de empresa, departamento, gerente e operação são respeitados."
+        )
+
+        # Não exibe filtros gerais de vendedor/cliente nesta aba.
+        # A análise considera todos os clientes da base após os filtros globais;
+        # a seleção de vendedor fica somente junto ao gráfico de share.
+        base_c = base_historica.copy()
+
+        if base_c.empty:
+            st.warning("Não há clientes disponíveis para a análise.")
+        else:
+            compras_mes = base_c[
+                base_c["_data"].ge(inicio_mes)
+                & base_c["_data"].lt(inicio_proximo_mes)
+                & (
+                    pd.to_numeric(base_c["_quantidade"], errors="coerce").gt(0)
+                    | pd.to_numeric(base_c["_valor"], errors="coerce").gt(0)
+                )
+            ].copy()
+            clientes_com_compra = set(compras_mes["_cliente"].dropna().astype(str).unique())
+
+            historico_clientes = (
+                base_c.groupby("_cliente", as_index=False)
+                .agg(**{"Última compra": ("_data", "max")})
+            )
+            sem_compra = historico_clientes[
+                ~historico_clientes["_cliente"].astype(str).isin(clientes_com_compra)
+            ].copy()
+
+            # Share histórico: faturamento do cliente / faturamento histórico do vendedor.
+            total_vendedor = base_c.groupby("_vendedor")["_valor"].sum()
+            resumo_cliente = (
+                base_c.groupby(["_vendedor", "_cliente"], as_index=False)
+                .agg(
+                    _faturamento_historico=("_valor", "sum"),
+                    _quantidade_historica=("_quantidade", "sum"),
+                )
+            )
+            resumo_cliente["_total_vendedor"] = resumo_cliente["_vendedor"].map(total_vendedor)
+            resumo_cliente["Share do vendedor (%)"] = (
+                resumo_cliente["_faturamento_historico"]
+                .div(resumo_cliente["_total_vendedor"].where(resumo_cliente["_total_vendedor"] != 0))
+                .mul(100).fillna(0).round(2)
+            )
+
+            # Complementa com o último responsável e os dados organizacionais conhecidos.
+            colunas_contexto = {"_vendedor": "Vendedor responsável", "_regiao": "Região / gerente"}
+            if col.get("departamento"):
+                colunas_contexto[col["departamento"]] = "Departamento"
+            if col.get("gerente_regiao"):
+                colunas_contexto[col["gerente_regiao"]] = "Gerente"
+            contexto = base_c.sort_values("_data", na_position="first").drop_duplicates("_cliente", keep="last")
+            manter = ["_cliente"] + [c for c in colunas_contexto if c in contexto.columns]
+            contexto = contexto[manter].rename(columns=colunas_contexto)
+
+            sem_compra = sem_compra.merge(contexto, on="_cliente", how="left")
+            resumo_share = resumo_cliente.rename(columns={"_vendedor": "Vendedor responsável"})
+            sem_compra = sem_compra.merge(
+                resumo_share[["_cliente", "Vendedor responsável", "_faturamento_historico", "_quantidade_historica", "Share do vendedor (%)"]],
+                on=["_cliente", "Vendedor responsável"], how="left"
+            ).rename(columns={
+                "_faturamento_historico": "Faturamento histórico (R$)",
+                "_quantidade_historica": "Quantidade histórica",
+            })
+            sem_compra = sem_compra.rename(columns={"_cliente": "Cliente gerencial"})
+            sem_compra["Última compra"] = pd.to_datetime(sem_compra["Última compra"], errors="coerce")
+            sem_compra = sem_compra.sort_values("Última compra", ascending=True, na_position="first")
+
+            total_clientes = base_c["_cliente"].nunique()
+            total_com_compra = len(clientes_com_compra)
+            total_sem_compra = len(sem_compra)
+            taxa_sem_compra = total_sem_compra / total_clientes * 100 if total_clientes else 0
+            faturamento_em_risco = sem_compra["Faturamento histórico (R$)"].sum() if not sem_compra.empty else 0
+
+            k1, k2, k3 = st.columns(3)
+            k1.metric("Clientes na seleção", f"{total_clientes:,}".replace(",", "."))
+            k2.metric("Clientes sem compra", f"{total_sem_compra:,}".replace(",", "."))
+            k3.metric("Percentual sem compra", pct_br(taxa_sem_compra))
+
+            st.metric("Faturamento histórico dos clientes sem compra", moeda(faturamento_em_risco))
+
+            if sem_compra.empty:
+                st.success(f"Todos os clientes da seleção possuem compra registrada em {rotulo_mes}.")
+            else:
+                st.subheader("Share entre os clientes sem compra — gráfico de pizza")
+                vendedores_grafico = sorted(base_c["_vendedor"].dropna().astype(str).unique().tolist())
+                if vendedores_grafico:
+                    vendedores_pizza_selecionados = multiselect_persistente(
+                        "Vendedor(es) para visualizar o share",
+                        vendedores_grafico,
+                        "vendedores_pizza_sem_compra",
+                    )
+                    if vendedores_pizza_selecionados:
+                        base_vendedores_pizza = base_c[
+                            base_c["_vendedor"].astype(str).isin(vendedores_pizza_selecionados)
+                        ].copy()
+                        clientes_pizza = sem_compra[
+                            sem_compra["Vendedor responsável"].astype(str).isin(vendedores_pizza_selecionados)
+                        ].copy()
+
+                        # Consolida o faturamento dos clientes sem compra nos vendedores selecionados.
+                        fatias = (
+                            clientes_pizza.groupby("Cliente gerencial", as_index=False)["Faturamento histórico (R$)"]
+                            .sum()
+                            .sort_values("Faturamento histórico (R$)", ascending=False)
+                        )
+                        faturamento_sem_compra_total = pd.to_numeric(
+                            fatias["Faturamento histórico (R$)"], errors="coerce"
+                        ).fillna(0).sum()
+
+                        # Exibe os 30 maiores clientes sem compra e agrupa os demais inativos.
+                        fatias_top = fatias.head(30).copy()
+                        faturamento_top = pd.to_numeric(
+                            fatias_top["Faturamento histórico (R$)"], errors="coerce"
+                        ).fillna(0).sum()
+                        demais_sem_compra = max(faturamento_sem_compra_total - faturamento_top, 0)
+                        fatias = fatias_top.rename(columns={"Cliente gerencial": "Cliente"})
+                        if demais_sem_compra > 0:
+                            fatias.loc[len(fatias)] = ["Demais clientes sem compra", demais_sem_compra]
+
+                        # A pizza representa exclusivamente a distribuição do faturamento
+                        # histórico entre os clientes sem compra no mês. Não inclui clientes ativos.
+                        fatias["Faturamento histórico (R$)"] = pd.to_numeric(
+                            fatias["Faturamento histórico (R$)"], errors="coerce"
+                        ).fillna(0)
+                        fatias = fatias[fatias["Faturamento histórico (R$)"] > 0]
+                        if not fatias.empty:
+                            rotulo_vendedores = (
+                                "Todos os vendedores" if len(vendedores_pizza_selecionados) == len(vendedores_grafico)
+                                else f"{len(vendedores_pizza_selecionados)} vendedor(es) selecionado(s)"
+                            )
+                            fig_share_pizza = px.pie(
+                                fatias,
+                                names="Cliente",
+                                values="Faturamento histórico (R$)",
+                                hole=0.38,
+                                title=f"Participação no faturamento histórico — {rotulo_vendedores}",
+                            )
+                            fig_share_pizza.update_traces(
+                                textposition="inside",
+                                texttemplate="%{percent:.1%}",
+                                hovertemplate="%{label}<br>Faturamento: R$ %{value:,.2f}<br>Share: %{percent:.2%}<extra></extra>",
+                            )
+                            fig_share_pizza.update_layout(
+                                showlegend=True,
+                                legend_title_text="Clientes",
+                                margin=dict(l=12, r=12, t=55, b=12),
+                            )
+                            evento_pizza = exibir_grafico_padronizado(
+                                fig_share_pizza,
+                                use_container_width=True,
+                                config={"displayModeBar": False},
+                                key="grafico_share_pizza_sem_compra_interativo",
+                                on_select="rerun",
+                                selection_mode="points",
+                            )
+                            ponto_pizza = ponto_clicado(evento_pizza)
+                            if ponto_pizza:
+                                cliente_pizza_clicado = str(ponto_pizza.get("label", "")).strip()
+                                if cliente_pizza_clicado and cliente_pizza_clicado != "Demais clientes sem compra":
+                                    correspondencias = clientes_pizza[
+                                        clientes_pizza["Cliente gerencial"].astype(str) == cliente_pizza_clicado
+                                    ]
+                                    if len(correspondencias) == 1:
+                                        vendedor_pizza_clicado = str(correspondencias.iloc[0]["Vendedor responsável"])
+                                        ir_para(
+                                            ABA_CLIENTE,
+                                            vendedores=[vendedor_pizza_clicado],
+                                            clientes=[cliente_pizza_clicado],
+                                        )
+                                    elif len(correspondencias) > 1:
+                                        vendedores_correspondentes = sorted(
+                                            correspondencias["Vendedor responsável"].dropna().astype(str).unique().tolist()
+                                        )
+                                        if len(vendedores_correspondentes) == 1:
+                                            ir_para(
+                                                ABA_CLIENTE,
+                                                vendedores=vendedores_correspondentes,
+                                                clientes=[cliente_pizza_clicado],
+                                            )
+                                        else:
+                                            st.info(
+                                                "Este cliente aparece associado a mais de um vendedor. "
+                                                "Selecione um único vendedor no filtro para abrir o histórico sem ambiguidade."
+                                            )
+                                elif cliente_pizza_clicado == "Demais clientes sem compra":
+                                    st.info("A fatia 'Demais clientes sem compra' reúne vários clientes. Clique em uma fatia individual para abrir o histórico.")
+                            st.caption(
+                                "Clique em uma fatia de cliente para abrir Vendas por cliente com os filtros "
+                                "de vendedor e cliente preenchidos. A fatia 'Demais clientes sem compra' "
+                                "é um agrupamento e não abre um cliente individual."
+                            )
+                        else:
+                            st.info("Não há faturamento histórico positivo para montar o gráfico de share na seleção atual.")
+                    else:
+                        st.info("Selecione pelo menos um vendedor para visualizar o gráfico de share.")
+
+                st.subheader("Lista de clientes sem compra")
+                busca_cliente = st.text_input(
+                    "Pesquisar cliente", key="busca_cliente_sem_compra",
+                    placeholder="Digite parte do nome do cliente..."
+                )
+                tabela_sem_compra = sem_compra.copy()
+                if busca_cliente.strip():
+                    tabela_sem_compra = tabela_sem_compra[
+                        tabela_sem_compra["Cliente gerencial"].astype(str).str.contains(
+                            re.escape(busca_cliente.strip()), case=False, na=False
+                        )
+                    ]
+                tabela_sem_compra["Última compra"] = tabela_sem_compra["Última compra"].dt.strftime("%d/%m/%Y").fillna("Sem histórico de data")
+                # Tabela interativa: selecionar uma linha leva diretamente à aba
+                # "Vendas por cliente", já filtrada pelo vendedor e pelo cliente escolhidos.
+                tabela_interativa = tabela_sem_compra.reset_index(drop=True)
+                evento_cliente = st.dataframe(
+                    tabela_interativa,
+                    use_container_width=True,
+                    hide_index=True,
+                    on_select="rerun",
+                    selection_mode="single-row",
+                    key="tabela_clientes_sem_compra_interativa",
+                )
+                indice_selecionado = linha_clicada(evento_cliente)
+                if indice_selecionado is not None and 0 <= indice_selecionado < len(tabela_interativa):
+                    cliente_selecionado = str(tabela_interativa.iloc[indice_selecionado]["Cliente gerencial"])
+                    vendedor_selecionado = str(tabela_interativa.iloc[indice_selecionado]["Vendedor responsável"])
+                    ir_para(
+                        ABA_CLIENTE,
+                        vendedores=[vendedor_selecionado],
+                        clientes=[cliente_selecionado],
+                    )
+
+                st.caption(
+                    "Para abrir o histórico comercial, clique na linha do cliente. "
+                    "Você será direcionado para Vendas por cliente com vendedor e cliente filtrados."
+                )
+                csv_sem_compra = tabela_sem_compra.to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    "Baixar clientes sem compra (CSV)", csv_sem_compra,
+                    file_name=f"clientes_sem_compra_{inicio_mes:%Y_%m}.csv",
+                    mime="text/csv", key="baixar_clientes_sem_compra",
+                )
 
 
 if aba_ativa == ABA_DADOS:

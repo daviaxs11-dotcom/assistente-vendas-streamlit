@@ -168,6 +168,19 @@ REGRAS:
 
     ou explique o que falta nos dados.
 
+11. Perguntas de AUSÊNCIA ("quais clientes NÃO compraram em outubro", "quem parou de comprar",
+    "produtos sem venda no trimestre") exigem uma consulta especial, pois quem não comprou não tem linha
+    nos dados. Formato (uma única consulta desse tipo, sem metricas e sem agrupar_por):
+    {"tipo": "sem_compra", "descricao": "...", "dimensao": "cliente",
+     "filtros": [{"dimensao": "mes_do_ano", "operador": "igual", "valores": [10]},
+                 {"dimensao": "ano", "operador": "igual", "valores": [2026]}],
+     "periodo": null, "universo": {"filtros": [], "periodo": null},
+     "ordenar_por": "faturamento", "direcao": "desc", "limite": 100}
+    "dimensao" é quem se quer listar (use uma de "dimensoes_para_consulta_sem_compra"). "filtros" e "periodo"
+    descrevem a COMPRA que não aconteceu. "universo" define quem é considerado (padrão: todos que já tiveram
+    venda na base; restrinja apenas se a pergunta pedir, por exemplo um segmento ou "nos últimos 12 meses").
+    "mês 10" = mes_do_ano igual a 10. Se o ano não for citado, use o ano da última data do período dos dados.
+
 """
 
 INSTRUCOES_IA = """
@@ -218,6 +231,12 @@ REGRAS OBRIGATÓRIAS:
 9. Para listas, apresente uma tabela em Markdown. Cite o período considerado quando houver.
 
 10. Se faltar informação para responder, faça uma pergunta objetiva de esclarecimento.
+
+11. Consultas com "tipo": "sem_compra" listam itens do universo que NÃO tiveram venda no "criterio_de_compra".
+   Use "resumo" (itens_no_universo, itens_que_compraram, itens_sem_compra) e informe o critério e o universo
+   considerados. "faturamento", "registros" e "ultima_compra" são históricos do item no universo, não do período
+   consultado. Se "itens_sem_compra" for 0, diga que todos os itens do universo compraram. Respeite "avisos"
+   e "truncado".
 
 """
 
@@ -1110,6 +1129,11 @@ def montar_esquema(quadro):
             valores_possiveis[dim] = f"{len(unicos)} valores distintos"
 
     esquema["dimensoes_texto_para_agrupar_e_filtrar"] = dims
+    esquema["tipos_de_consulta"] = {
+        "agregada": "padrão: agrupa e soma o que existe nas linhas",
+        "sem_compra": "ausência: itens do universo que NÃO tiveram venda no critério (ver regra 11)",
+    }
+    esquema["dimensoes_para_consulta_sem_compra"] = list(dims)
 
     if quadro.tem_data:
 
@@ -1174,7 +1198,84 @@ def _chave(x):
 
     return normalizar(x).replace(" ", "_")
 
+TIPOS_SEM_COMPRA = {"sem_compra", "nao_compraram", "nao_comprou", "nao_compra", "sem_venda", "sem_vendas", "ausencia"}
+LIMITE_PADRAO_SEM_COMPRA = 100
+
+def _validar_filtros_lista(brutos, filtros_validos):
+    filtros = []
+    for f in _lista(brutos):
+        if not isinstance(f, dict):
+            raise ValueError("filtro inválido")
+        dim = _chave(f.get("dimensao") or "")
+        if dim not in filtros_validos:
+            raise ValueError(f"filtro por '{dim}' indisponível nos dados")
+        op = OPERADORES.get(_chave(f.get("operador") or "igual"))
+        if op is None:
+            raise ValueError("operador de filtro inválido")
+        valores = [v for v in _lista(f.get("valores", f.get("valor"))) if isinstance(v, (str, int, float)) and str(v).strip() != ""][:20]
+        if not valores:
+            raise ValueError(f"filtro de '{dim}' sem valores")
+        if dim in FILTROS_TEMPO:
+            try:
+                valores = [int(float(v)) for v in valores]
+            except (TypeError, ValueError):
+                raise ValueError(f"valores inválidos para o filtro '{dim}'")
+        filtros.append({"dimensao": dim, "operador": op, "valores": valores})
+    return filtros
+
+def _validar_periodo_dict(p, tem_data):
+    if not p:
+        return None
+    if not tem_data:
+        raise ValueError("a base não tem coluna de data para filtrar período")
+    if not isinstance(p, dict):
+        raise ValueError("período inválido")
+    periodo = {}
+    for campo in ("inicio", "fim"):
+        if p.get(campo):
+            data = pd.to_datetime(p.get(campo), errors="coerce")
+            if pd.isna(data):
+                raise ValueError(f"data de {campo} do período inválida")
+            periodo[campo] = data.strftime("%Y-%m-%d")
+    return periodo or None
+
+def _validar_sem_compra(c, dims_agrupar, filtros_validos, tem_data):
+    """Consulta de AUSÊNCIA: itens do universo que NÃO tiveram venda no critério informado."""
+    candidatos = _lista(c.get("agrupar_por"))
+    dim = _chave(c.get("dimensao") or (candidatos[0] if candidatos else ""))
+    if dim not in dims_agrupar or dim in TEMPO_AGRUPAR:
+        raise ValueError(f"consulta de ausência por '{dim}' indisponível nos dados")
+    filtros = _validar_filtros_lista(c.get("filtros"), filtros_validos)
+    periodo = _validar_periodo_dict(c.get("periodo"), tem_data)
+    if not filtros and not periodo:
+        raise ValueError("a consulta de ausência precisa de período ou filtro que defina a compra")
+    u = c.get("universo") if isinstance(c.get("universo"), dict) else {}
+    universo = {
+        "filtros": _validar_filtros_lista(u.get("filtros"), filtros_validos),
+        "periodo": _validar_periodo_dict(u.get("periodo"), tem_data),
+    }
+    ordenar = _chave(c["ordenar_por"]) if c.get("ordenar_por") else None
+    if ordenar not in {dim, "faturamento", "registros", "ultima_compra"}:
+        ordenar = None
+    direcao = _chave(c.get("direcao") or "")
+    direcao = "asc" if direcao in {"asc", "crescente"} else "desc" if direcao in {"desc", "decrescente"} else None
+    try:
+        limite = int(c.get("limite") or LIMITE_PADRAO_SEM_COMPRA)
+    except (TypeError, ValueError):
+        limite = LIMITE_PADRAO_SEM_COMPRA
+    return {
+        "tipo": "sem_compra", "dimensao": dim, "descricao": str(c.get("descricao") or "")[:200],
+        "agrupar_por": [dim], "metricas": [], "filtros": filtros, "periodo": periodo, "universo": universo,
+        "somente_ultima_data": False, "ordenar_por": ordenar, "direcao": direcao,
+        "limite": max(1, min(limite, LIMITE_MAXIMO)),
+    }
+
 def _validar_consulta(c, dims_agrupar, filtros_validos, metricas_validas, tem_data):
+    if _chave(c.get("tipo") or "") in TIPOS_SEM_COMPRA:
+        return _validar_sem_compra(c, dims_agrupar, filtros_validos, tem_data)
+    return _validar_consulta_agregada(c, dims_agrupar, filtros_validos, metricas_validas, tem_data)
+
+def _validar_consulta_agregada(c, dims_agrupar, filtros_validos, metricas_validas, tem_data):
 
     agrupar = []
 
@@ -1482,7 +1583,112 @@ def _json_valor(v):
 
     return v
 
+def _mascara_criterio(quadro, filtros, periodo, reverso, avisos):
+    """Máscara de linhas que atendem a filtros + período (sem herdar filtros visuais do painel)."""
+    tab = quadro.tab
+    mascara = pd.Series(True, index=tab.index)
+    for f in filtros:
+        mascara &= _mascara_filtro(quadro, f, reverso, avisos)
+    usa_tempo = bool(periodo or any(f["dimensao"] in FILTROS_TEMPO for f in filtros))
+    if periodo:
+        if periodo.get("inicio"):
+            mascara &= tab["d"] >= pd.Timestamp(periodo["inicio"])
+        if periodo.get("fim"):
+            mascara &= tab["d"] <= pd.Timestamp(periodo["fim"])
+    if usa_tempo:
+        mascara &= tab["d"].notna()
+    return mascara
+
+def _executar_sem_compra(quadro, consulta, mapa, limite_maximo=LIMITE_MAXIMO):
+    """Quem NÃO comprou: itens do universo (padrão: todos que já tiveram venda na base) menos os que
+    tiveram venda no critério. Calculado localmente; só pseudônimos e agregados voltam."""
+    tab = quadro.tab
+    dim = consulta["dimensao"]
+    chave = quadro.coluna(dim)
+    reverso = _mapa_reverso(mapa)
+    avisos = []
+    universo = consulta.get("universo") or {"filtros": [], "periodo": None}
+
+    m_univ = _mascara_criterio(quadro, universo.get("filtros", []), universo.get("periodo"), reverso, avisos)
+    m_comp = _mascara_criterio(quadro, consulta["filtros"], consulta["periodo"], reverso, avisos)
+
+    base = tab[m_univ]
+    base = base[~base[chave].map(lambda v: normalizar(v) in PLACEHOLDERS)]
+    compraram = set(tab.loc[m_comp, chave].unique())
+
+    resultado = {
+        "descricao": consulta["descricao"], "tipo": "sem_compra", "dimensao": dim,
+        "explicacao": (
+            f"Lista de '{dim}' do universo que NÃO tiveram nenhuma venda no critério de compra. "
+            "'faturamento', 'registros' e 'ultima_compra' são históricos, dentro do universo."
+        ),
+        "criterio_de_compra": {"filtros": consulta["filtros"], "periodo": consulta["periodo"]},
+        "universo": universo,
+    }
+
+    if base.empty:
+        resultado.update({
+            "totais_do_filtro": {"registros": 0, "faturamento": 0.0},
+            "resumo": {"itens_no_universo": 0, "itens_que_compraram": 0, "itens_sem_compra": 0},
+            "avisos": avisos, "linhas_totais": 0, "linhas_retornadas": 0, "truncado": False, "linhas": [],
+        })
+        return resultado
+
+    mostra_data = quadro.tem_data and not _data_pedido_sensivel(quadro.cols)
+    spec = {"faturamento": ("v", "sum"), "registros": ("v", "size")}
+    if mostra_data:
+        spec["ultima_compra"] = ("d", "max")
+    grupos = base.groupby(chave, sort=False).agg(**spec)
+
+    n_univ = int(len(grupos))
+    sem = grupos[~grupos.index.isin(compraram)].reset_index().rename(columns={chave: dim})
+    n_sem = int(len(sem))
+
+    if not (m_comp.any()):
+        avisos.append(
+            "Nenhuma venda encontrada para o critério de compra informado: todos os itens aparecem como "
+            "'sem compra'. Confira se a base cobre esse período."
+        )
+    elif quadro.tem_data and consulta["periodo"] and consulta["periodo"].get("inicio") \
+            and pd.Timestamp(consulta["periodo"]["inicio"]) > tab["d"].max():
+        avisos.append("O período consultado começa depois da última data da base.")
+    if any(f["dimensao"] == "mes_do_ano" for f in consulta["filtros"]) and not any(
+        f["dimensao"] == "ano" for f in consulta["filtros"]
+    ) and not consulta["periodo"]:
+        avisos.append("O mês foi consultado sem ano definido: considera esse mês em qualquer ano da base.")
+
+    ordenar = consulta["ordenar_por"] or ("faturamento" if "faturamento" in sem.columns else dim)
+    if ordenar in sem.columns:
+        crescente = (consulta["direcao"] == "asc") if consulta["direcao"] else (ordenar == dim)
+        sem = sem.sort_values(ordenar, ascending=crescente, na_position="last", kind="stable")
+
+    limite = min(consulta["limite"], limite_maximo)
+    sem = sem.head(limite).copy()
+
+    prefixo = DIMENSOES_TEXTO.get(dim, {}).get("prefixo") or quadro.cols.get("_prefixos_sensiveis", {}).get(dim)
+    if prefixo:
+        sem[dim] = sem[dim].map(lambda nome: _pseudonimo(mapa, prefixo, str(nome)))
+    else:
+        sem[dim] = sem[dim].map(sanitizar_valor_textual)
+
+    sem = sem.astype(object)
+    resultado.update({
+        "totais_do_filtro": {"registros": int(len(base)), "faturamento": round(float(base["v"].sum()), 2)},
+        "resumo": {"itens_no_universo": n_univ, "itens_que_compraram": n_univ - n_sem, "itens_sem_compra": n_sem},
+        "avisos": avisos,
+        "linhas_totais": n_sem,
+        "linhas_retornadas": int(len(sem)),
+        "truncado": n_sem > len(sem),
+        "linhas": [{k: _json_valor(v) for k, v in linha.items()} for linha in sem.to_dict("records")],
+    })
+    return resultado
+
 def executar_consulta(quadro, consulta, mapa, limite_maximo=LIMITE_MAXIMO):
+    if consulta.get("tipo") == "sem_compra":
+        return _executar_sem_compra(quadro, consulta, mapa, limite_maximo)
+    return _executar_consulta_agregada(quadro, consulta, mapa, limite_maximo)
+
+def _executar_consulta_agregada(quadro, consulta, mapa, limite_maximo=LIMITE_MAXIMO):
 
     """Executa uma consulta validada no DataFrame local e devolve linhas agregadas (com pseudônimos)."""
 
@@ -2029,6 +2235,15 @@ def aplicar_fuzzy_base(pergunta, quadro):
     return texto
 
 
+def _pergunta_pede_ausencia(pergunta):
+    """True para perguntas como "quais clientes não compraram...", "quem parou de comprar..."."""
+    p = normalizar(pergunta)
+    return bool(re.search(
+        r"\bnao (?:compr|vend|fiz|fez|tiver|tem |pedi|faturar)|\bsem (?:compra|venda|pedido|faturamento)"
+        r"|\b(?:parou|pararam|deixou|deixaram) de (?:comprar|vender)|\bnunca (?:compr|vend)|\binativ",
+        p,
+    ))
+
 def processar_pergunta(df, cols, pergunta, mapa, historico, gerar, etapa=None):
 
     """Planeja -> executa localmente -> responde.
@@ -2142,6 +2357,18 @@ def processar_pergunta(df, cols, pergunta, mapa, historico, gerar, etapa=None):
             )
         texto_plano = gerar(prompt_planejador, INSTRUCOES_PLANEJADOR, True)
         consultas, avisos, esclarecimento = validar_plano(_extrair_json(texto_plano), cols, quadro.tem_data)
+        # Pergunta de AUSÊNCIA ("quem não comprou"): se o plano veio agregado, pede uma vez o tipo correto.
+        if (
+            _pergunta_pede_ausencia(pergunta) and not esclarecimento
+            and not any(c.get("tipo") == "sem_compra" for c in consultas)
+        ):
+            texto_plano = gerar(
+                prompt_planejador
+                + "\n\nATENÇÃO: a pergunta pede itens que NÃO compraram/venderam. Use obrigatoriamente UMA consulta "
+                  "do tipo \"sem_compra\" (regra 11), com os filtros da compra que não ocorreu.",
+                INSTRUCOES_PLANEJADOR, True,
+            )
+            consultas, avisos, esclarecimento = validar_plano(_extrair_json(texto_plano), cols, quadro.tem_data)
         detalhes = {"rota": "planejamento_ia", "pergunta_enviada": pergunta_segura, "plano": consultas, "avisos": avisos}
 
     # Defesa local: se a pergunta identificou um cliente da base, todas as consultas
@@ -2166,6 +2393,11 @@ def processar_pergunta(df, cols, pergunta, mapa, historico, gerar, etapa=None):
                 "operador": "igual",
                 "valores": clientes_mencionados,
             })
+        for consulta in consultas:
+            if consulta.get("tipo") == "sem_compra":
+                universo = consulta.setdefault("universo", {"filtros": [], "periodo": None})
+                universo["filtros"] = [f for f in universo.get("filtros", []) if f.get("dimensao") != "cliente"]
+                universo["filtros"].append({"dimensao": "cliente", "operador": "igual", "valores": clientes_mencionados})
         avisos.append("Filtro de cliente aplicado localmente para garantir que os resultados correspondam ao cliente mencionado.")
 
     detalhes = {"pergunta_enviada": pergunta_segura, "plano": consultas, "avisos": avisos}
@@ -2240,7 +2472,8 @@ def processar_pergunta(df, cols, pergunta, mapa, historico, gerar, etapa=None):
 
                 {"descricao": c["descricao"], "agrupar_por": c["agrupar_por"], "metricas": c["metricas"],
 
-                 "filtros": c["filtros"], "periodo": c["periodo"], "somente_ultima_data": c["somente_ultima_data"]}
+                 "filtros": c["filtros"], "periodo": c["periodo"], "somente_ultima_data": c["somente_ultima_data"],
+                 "tipo": c.get("tipo"), "universo": c.get("universo")}
 
                 for c in consultas
 
